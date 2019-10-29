@@ -1,0 +1,5 @@
+# atree index extension
+comment = 'atree implementation for pg extension'
+default_version = '0.1'
+module_pathname = '$libdir/atree'
+relocatable = true
