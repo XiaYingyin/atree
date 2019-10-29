@@ -67,3 +67,8 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
+# pg extension obj file
+*.bc
+
+# extension object
+atree

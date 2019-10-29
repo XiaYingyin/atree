@@ -560,7 +560,12 @@ _bt_build_callback(Relation index,
   // use this callback func to construct linear function by scan table tuples
 	BTBuildState *buildstate = (BTBuildState *) state;
 
-	/*
+  /*
+   * TODO: add codes to approximate function by Zhang Shaomin
+   *
+   */
+
+  /*
 	 * insert the index tuple into the appropriate spool file for subsequent
 	 * processing
 	 */

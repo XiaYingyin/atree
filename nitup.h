@@ -29,5 +29,8 @@ typedef struct NIndexTupleData
 
 	unsigned short t_info;		/* various info about tuple */
 
-} IndexTupleData;				/* MORE DATA FOLLOWS AT END OF STRUCT */
+} NIndexTupleData;				/* MORE DATA FOLLOWS AT END OF STRUCT */
+
+typedef NIndexTupleData *NIndexTuple;
+
 #endif

@@ -17,7 +17,7 @@
 
 #include <time.h>
 
-#include "access/nbtree.h"
+#include "nbtree.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
 #include "miscadmin.h"
@@ -34,6 +34,14 @@ typedef struct BTSortArrayContext
 	bool		reverse;
 } BTSortArrayContext;
 
+typedef struct KeyPosPairData
+{
+  int pos;
+  unsigned short t_info;
+} KeyPosPairData;
+
+typedef KeyPosPairData *KeyPosPair;
+
 static Datum _bt_find_extreme_element(IndexScanDesc scan, ScanKey skey,
 						 StrategyNumber strat,
 						 Datum *elems, int nelems);
@@ -49,6 +57,7 @@ static void _bt_mark_scankey_required(ScanKey skey);
 static bool _bt_check_rowcompare(ScanKey skey,
 					 IndexTuple tuple, TupleDesc tupdesc,
 					 ScanDirection dir, bool *continuescan);
+static KeyPosPair kppair_from_index(IndexTuple itup);
 
 
 /*
@@ -2213,4 +2222,13 @@ _bt_check_natts(Relation rel, Page page, OffsetNumber offnum)
 		}
 
 	}
+}
+
+KeyPosPair kppair_from_index(IndexTuple itup) 
+{
+  int pageSize = 20;
+  KeyPosPair kppair = (KeyPosPairData*) palloc(sizeof(KeyPosPairData));
+  kppair->pos = ItemPointerGetBlockNumberNoCheck((&(itup->t_tid))) * pageSize + (itup->t_tid).ip_posid; 
+
+  return kppair;
 }
