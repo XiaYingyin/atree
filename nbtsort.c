@@ -545,6 +545,40 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 	_bt_load(&wstate, btspool, btspool2);
 }
 
+
+//start是上一个拟合函数的起点，tuple是刚读进来处理的元组，slope_low、slope_high需要高一点的作用域，误差err先写死
+void 
+ShrinkingCone(KeyPosPairData tuple, KeyPosPairData start, &float slope_low, &float slope_high, float err)
+{
+	//x,y代指key，value
+	float x, y;
+	x = tuple->t_info;
+	y = tuple->pos;
+	NIndexTupleData nindextuple;
+	if(tuple == firsttuple)//需要判断tuple是不是索引列上第一个元素（TODO）
+	{
+		nindextuple = NIndexTupleData(tuple->t_info, 0);//构建一个新的起点斜率对
+		store(nindextuple);//把tuple的（TODO）
+	}
+	else if(((y - start->pos) >= (x - start->info) * slope_low) && ((y - start->pos) <= (x - start->t_info) * slope_high))
+	{
+		slope_low = ((y - err) - start->pos) / (x - start->t_info);
+		slope_high = ((y + err) - start->pos) / (x - start->t_info);
+	}
+	else
+	{
+		nindextuple = NIndexTupleData(x, slope_high);
+		store(nindextuple);
+		slope_low = 0;
+		slpoe_high = 100000000;//取一个极大数
+	}
+	
+}
+//////////////////
+
+
+
+
 /*
  * Per-tuple callback from IndexBuildHeapScan
  * Every Scan will call this callback
