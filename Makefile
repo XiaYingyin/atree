@@ -1,4 +1,4 @@
-EXTENSION = atree
+EXTENSION = ftree
 EXTVERSION   = $(shell grep default_version $(EXTENSION).control | sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
 TESTS        = $(wildcard test/sql/*.sql)
 
@@ -11,10 +11,10 @@ TESTS        = $(wildcard test/sql/*.sql)
 
 PG_CONFIG ?= pg_config
 
-MODULE_big = atree 
+MODULE_big = ftree 
 
-OBJS = nbtcompare.o nbtinsert.o nbtpage.o nbtree.o nbtsearch.o \
-       nbtutils.o nbtsort.o nbtvalidate.o nbtxlog.o
+OBJS = ftcompare.o ftinsert.o ftpage.o ftree.o ftsearch.o \
+       ftutils.o ftsort.o ftvalidate.o ftxlog.o
 
 DATA = $(wildcard *--*.sql)
 PGXS := $(shell $(PG_CONFIG) --pgxs)

@@ -21,9 +21,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-#include "access/nbtree.h"
-#include "access/nbtxlog.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -33,7 +30,10 @@
 #include "storage/predicate.h"
 #include "utils/snapmgr.h"
 
-static void _bt_cachemetadata(Relation rel, BTMetaPageData *metad);
+#include "ftree.h"
+#include "ftxlog.h"
+
+static void _ft_cachemetadata(Relation rel, BTMetaPageData *metad);
 static bool _bt_mark_page_halfdead(Relation rel, Buffer buf, BTStack stack);
 static bool _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf,
 						 bool *rightsib_empty);
@@ -44,15 +44,15 @@ static void _bt_log_reuse_page(Relation rel, BlockNumber blkno,
 				   TransactionId latestRemovedXid);
 
 /*
- *	_bt_initmetapage() -- Fill a page buffer with a correct metapage image
+ *	_ft_initmetapage() -- Fill a page buffer with a correct metapage image
  */
 void
-_bt_initmetapage(Page page, BlockNumber rootbknum, uint32 level)
+_ft_initmetapage(Page page, BlockNumber rootbknum, uint32 level)
 {
 	BTMetaPageData *metad;
-	BTPageOpaque metaopaque;
+	FTPageOpaque metaopaque;
 
-	_bt_pageinit(page, BLCKSZ);
+	_ft_pageinit(page, BLCKSZ);
 
 	metad = BTPageGetMeta(page);
 	metad->btm_magic = BTREE_MAGIC;
@@ -64,7 +64,7 @@ _bt_initmetapage(Page page, BlockNumber rootbknum, uint32 level)
 	metad->btm_oldest_btpo_xact = InvalidTransactionId;
 	metad->btm_last_cleanup_num_heap_tuples = -1.0;
 
-	metaopaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	metaopaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	metaopaque->btpo_flags = BTP_META;
 
 	/*
@@ -86,10 +86,10 @@ void
 _bt_upgrademetapage(Page page)
 {
 	BTMetaPageData *metad;
-	BTPageOpaque metaopaque PG_USED_FOR_ASSERTS_ONLY;
+	FTPageOpaque metaopaque PG_USED_FOR_ASSERTS_ONLY;
 
 	metad = BTPageGetMeta(page);
-	metaopaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	metaopaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	/* It must be really a meta page of upgradable version */
 	Assert(metaopaque->btpo_flags & BTP_META);
@@ -101,7 +101,7 @@ _bt_upgrademetapage(Page page)
 	metad->btm_oldest_btpo_xact = InvalidTransactionId;
 	metad->btm_last_cleanup_num_heap_tuples = -1.0;
 
-	/* Adjust pd_lower (see _bt_initmetapage() for details) */
+	/* Adjust pd_lower (see _ft_initmetapage() for details) */
 	((PageHeader) page)->pd_lower =
 		((char *) metad + sizeof(BTMetaPageData)) - (char *) page;
 }
@@ -110,7 +110,7 @@ _bt_upgrademetapage(Page page)
  * Cache metadata from meta page to rel->rd_amcache.
  */
 static void
-_bt_cachemetadata(Relation rel, BTMetaPageData *metad)
+_ft_cachemetadata(Relation rel, BTMetaPageData *metad)
 {
 	/* We assume rel->rd_amcache was already freed by caller */
 	Assert(rel->rd_amcache == NULL);
@@ -253,10 +253,10 @@ _bt_getroot(Relation rel, int access)
 {
 	Buffer		metabuf;
 	Page		metapg;
-	BTPageOpaque metaopaque;
+	FTPageOpaque metaopaque;
 	Buffer		rootbuf;
 	Page		rootpage;
-	BTPageOpaque rootopaque;
+	FTPageOpaque rootopaque;
 	BlockNumber rootblkno;
 	uint32		rootlevel;
 	BTMetaPageData *metad;
@@ -281,7 +281,7 @@ _bt_getroot(Relation rel, int access)
 
 		rootbuf = _bt_getbuf(rel, rootblkno, BT_READ);
 		rootpage = BufferGetPage(rootbuf);
-		rootopaque = (BTPageOpaque) PageGetSpecialPointer(rootpage);
+		rootopaque = (FTPageOpaque) PageGetSpecialPointer(rootpage);
 
 		/*
 		 * Since the cache might be stale, we check the page more carefully
@@ -307,7 +307,7 @@ _bt_getroot(Relation rel, int access)
 
 	metabuf = _bt_getbuf(rel, BTREE_METAPAGE, BT_READ);
 	metapg = BufferGetPage(metabuf);
-	metaopaque = (BTPageOpaque) PageGetSpecialPointer(metapg);
+	metaopaque = (FTPageOpaque) PageGetSpecialPointer(metapg);
 	metad = BTPageGetMeta(metapg);
 
 	/* sanity-check the metapage */
@@ -366,7 +366,7 @@ _bt_getroot(Relation rel, int access)
 		rootbuf = _bt_getbuf(rel, P_NEW, BT_WRITE);
 		rootblkno = BufferGetBlockNumber(rootbuf);
 		rootpage = BufferGetPage(rootbuf);
-		rootopaque = (BTPageOpaque) PageGetSpecialPointer(rootpage);
+		rootopaque = (FTPageOpaque) PageGetSpecialPointer(rootpage);
 		rootopaque->btpo_prev = rootopaque->btpo_next = P_NONE;
 		rootopaque->btpo_flags = (BTP_LEAF | BTP_ROOT);
 		rootopaque->btpo.level = 0;
@@ -442,7 +442,7 @@ _bt_getroot(Relation rel, int access)
 		/*
 		 * Cache the metapage data for next time
 		 */
-		_bt_cachemetadata(rel, metad);
+		_ft_cachemetadata(rel, metad);
 
 		/*
 		 * We are done with the metapage; arrange to release it via first
@@ -454,7 +454,7 @@ _bt_getroot(Relation rel, int access)
 		{
 			rootbuf = _bt_relandgetbuf(rel, rootbuf, rootblkno, BT_READ);
 			rootpage = BufferGetPage(rootbuf);
-			rootopaque = (BTPageOpaque) PageGetSpecialPointer(rootpage);
+			rootopaque = (FTPageOpaque) PageGetSpecialPointer(rootpage);
 
 			if (!P_IGNORE(rootopaque))
 				break;
@@ -499,10 +499,10 @@ _bt_gettrueroot(Relation rel)
 {
 	Buffer		metabuf;
 	Page		metapg;
-	BTPageOpaque metaopaque;
+	FTPageOpaque metaopaque;
 	Buffer		rootbuf;
 	Page		rootpage;
-	BTPageOpaque rootopaque;
+	FTPageOpaque rootopaque;
 	BlockNumber rootblkno;
 	uint32		rootlevel;
 	BTMetaPageData *metad;
@@ -519,7 +519,7 @@ _bt_gettrueroot(Relation rel)
 
 	metabuf = _bt_getbuf(rel, BTREE_METAPAGE, BT_READ);
 	metapg = BufferGetPage(metabuf);
-	metaopaque = (BTPageOpaque) PageGetSpecialPointer(metapg);
+	metaopaque = (FTPageOpaque) PageGetSpecialPointer(metapg);
 	metad = BTPageGetMeta(metapg);
 
 	if (!P_ISMETA(metaopaque) ||
@@ -558,7 +558,7 @@ _bt_gettrueroot(Relation rel)
 	{
 		rootbuf = _bt_relandgetbuf(rel, rootbuf, rootblkno, BT_READ);
 		rootpage = BufferGetPage(rootbuf);
-		rootopaque = (BTPageOpaque) PageGetSpecialPointer(rootpage);
+		rootopaque = (FTPageOpaque) PageGetSpecialPointer(rootpage);
 
 		if (!P_IGNORE(rootopaque))
 			break;
@@ -603,11 +603,11 @@ _bt_getrootheight(Relation rel)
 	{
 		Buffer		metabuf;
 		Page		metapg;
-		BTPageOpaque metaopaque;
+		FTPageOpaque metaopaque;
 
 		metabuf = _bt_getbuf(rel, BTREE_METAPAGE, BT_READ);
 		metapg = BufferGetPage(metabuf);
-		metaopaque = (BTPageOpaque) PageGetSpecialPointer(metapg);
+		metaopaque = (FTPageOpaque) PageGetSpecialPointer(metapg);
 		metad = BTPageGetMeta(metapg);
 
 		/* sanity-check the metapage */
@@ -641,7 +641,7 @@ _bt_getrootheight(Relation rel)
 		/*
 		 * Cache the metapage data for next time
 		 */
-		_bt_cachemetadata(rel, metad);
+		_ft_cachemetadata(rel, metad);
 
 		_bt_relbuf(rel, metabuf);
 	}
@@ -680,7 +680,7 @@ _bt_checkpage(Relation rel, Buffer buf)
 	/*
 	 * Additionally check that the special area looks sane.
 	 */
-	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(BTPageOpaqueData)))
+	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(FTPageOpaqueData)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" contains corrupted page at block %u",
@@ -791,13 +791,13 @@ _bt_getbuf(Relation rel, BlockNumber blkno, int access)
 					if (XLogStandbyInfoActive() && RelationNeedsWAL(rel) &&
 						!PageIsNew(page))
 					{
-						BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+						FTPageOpaque opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 						_bt_log_reuse_page(rel, blkno, opaque->btpo.xact);
 					}
 
 					/* Okay to use page.  Re-initialize and return it */
-					_bt_pageinit(page, BufferGetPageSize(buf));
+					_ft_pageinit(page, BufferGetPageSize(buf));
 					return buf;
 				}
 				elog(DEBUG2, "FSM returned nonrecyclable page");
@@ -841,7 +841,7 @@ _bt_getbuf(Relation rel, BlockNumber blkno, int access)
 		/* Initialize the new page before returning it */
 		page = BufferGetPage(buf);
 		Assert(PageIsNew(page));
-		_bt_pageinit(page, BufferGetPageSize(buf));
+		_ft_pageinit(page, BufferGetPageSize(buf));
 	}
 
 	/* ref count and lock type are correct */
@@ -887,15 +887,15 @@ _bt_relbuf(Relation rel, Buffer buf)
 }
 
 /*
- *	_bt_pageinit() -- Initialize a new page.
+ *	_ft_pageinit() -- Initialize a new page.
  *
  * On return, the page header is initialized; data space is empty;
  * special space is zeroed out.
  */
 void
-_bt_pageinit(Page page, Size size)
+_ft_pageinit(Page page, Size size)
 {
-	PageInit(page, size, sizeof(BTPageOpaqueData));
+	PageInit(page, size, sizeof(FTPageOpaqueData));
 }
 
 /*
@@ -910,7 +910,7 @@ _bt_pageinit(Page page, Size size)
 bool
 _bt_page_recyclable(Page page)
 {
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 
 	/*
 	 * It's possible to find an all-zeroes page in an index --- for example, a
@@ -925,7 +925,7 @@ _bt_page_recyclable(Page page)
 	 * Otherwise, recycle if deleted and too old to have any processes
 	 * interested in it.
 	 */
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	if (P_ISDELETED(opaque) &&
 		TransactionIdPrecedes(opaque->btpo.xact, RecentGlobalXmin))
 		return true;
@@ -958,7 +958,7 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 					BlockNumber lastBlockVacuumed)
 {
 	Page		page = BufferGetPage(buf);
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 
 	/* No ereport(ERROR) until changes are logged */
 	START_CRIT_SECTION();
@@ -971,7 +971,7 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	 * We can clear the vacuum cycle ID since this page has certainly been
 	 * processed by the current vacuum scan.
 	 */
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	opaque->btpo_cycleid = 0;
 
 	/*
@@ -1031,7 +1031,7 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 					Relation heapRel)
 {
 	Page		page = BufferGetPage(buf);
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(nitems > 0);
@@ -1054,7 +1054,7 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	 * true and it doesn't seem worth an additional page scan to check it.
 	 * Remember that BTP_HAS_GARBAGE is only a hint anyway.
 	 */
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	opaque->btpo_flags &= ~BTP_HAS_GARBAGE;
 
 	MarkBufferDirty(buf);
@@ -1095,12 +1095,12 @@ _bt_is_page_halfdead(Relation rel, BlockNumber blk)
 {
 	Buffer		buf;
 	Page		page;
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 	bool		result;
 
 	buf = _bt_getbuf(rel, blk, BT_READ);
 	page = BufferGetPage(buf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	result = P_ISHALFDEAD(opaque);
 	_bt_relbuf(rel, buf);
@@ -1144,7 +1144,7 @@ _bt_lock_branch_parent(Relation rel, BlockNumber child, BTStack stack,
 				maxoff;
 	Buffer		pbuf;
 	Page		page;
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 	BlockNumber leftsib;
 
 	/*
@@ -1160,7 +1160,7 @@ _bt_lock_branch_parent(Relation rel, BlockNumber child, BTStack stack,
 	poffset = stack->bts_offset;
 
 	page = BufferGetPage(pbuf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	maxoff = PageGetMaxOffsetNumber(page);
 
 	/*
@@ -1200,11 +1200,11 @@ _bt_lock_branch_parent(Relation rel, BlockNumber child, BTStack stack,
 			{
 				Buffer		lbuf;
 				Page		lpage;
-				BTPageOpaque lopaque;
+				FTPageOpaque lopaque;
 
 				lbuf = _bt_getbuf(rel, leftsib, BT_READ);
 				lpage = BufferGetPage(lbuf);
-				lopaque = (BTPageOpaque) PageGetSpecialPointer(lpage);
+				lopaque = (FTPageOpaque) PageGetSpecialPointer(lpage);
 
 				/*
 				 * If the left sibling was concurrently split, so that its
@@ -1279,7 +1279,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 	BlockNumber rightsib;
 	bool		rightsib_empty;
 	Page		page;
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 
 	/*
 	 * "stack" is a search stack leading (approximately) to the target page.
@@ -1295,7 +1295,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 	for (;;)
 	{
 		page = BufferGetPage(buf);
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 		/*
 		 * Internal pages are never deleted directly, only as part of deleting
@@ -1395,12 +1395,12 @@ _bt_pagedel(Relation rel, Buffer buf)
 				 */
 				if (!P_LEFTMOST(opaque))
 				{
-					BTPageOpaque lopaque;
+					FTPageOpaque lopaque;
 					Page		lpage;
 
 					lbuf = _bt_getbuf(rel, leftsib, BT_READ);
 					lpage = BufferGetPage(lbuf);
-					lopaque = (BTPageOpaque) PageGetSpecialPointer(lpage);
+					lopaque = (FTPageOpaque) PageGetSpecialPointer(lpage);
 
 					/*
 					 * If the left sibling is split again by another backend,
@@ -1501,7 +1501,7 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	BlockNumber rightsib;
 	ItemId		itemid;
 	Page		page;
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 	Buffer		topparent;
 	OffsetNumber topoff;
 	OffsetNumber nextoffset;
@@ -1509,7 +1509,7 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	IndexTupleData trunctuple;
 
 	page = BufferGetPage(leafbuf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	Assert(!P_RIGHTMOST(opaque) && !P_ISROOT(opaque) && !P_ISDELETED(opaque) &&
 		   !P_ISHALFDEAD(opaque) && P_ISLEAF(opaque) &&
@@ -1562,7 +1562,7 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	 * fail in the field, though.
 	 */
 	page = BufferGetPage(topparent);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 #ifdef USE_ASSERT_CHECKING
 	itemid = PageGetItemId(page, topoff);
@@ -1594,7 +1594,7 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	 * delete the following item.
 	 */
 	page = BufferGetPage(topparent);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	itemid = PageGetItemId(page, topoff);
 	itup = (IndexTuple) PageGetItem(page, itemid);
@@ -1609,7 +1609,7 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	 * the high key to store it.
 	 */
 	page = BufferGetPage(leafbuf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	opaque->btpo_flags |= BTP_HALF_DEAD;
 
 	PageIndexTupleDelete(page, P_HIKEY);
@@ -1647,7 +1647,7 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 		XLogRegisterBuffer(1, topparent, REGBUF_STANDARD);
 
 		page = BufferGetPage(leafbuf);
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 		xlrec.leftblk = opaque->btpo_prev;
 		xlrec.rightblk = opaque->btpo_next;
 
@@ -1701,14 +1701,14 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	BTMetaPageData *metad = NULL;
 	ItemId		itemid;
 	Page		page;
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 	bool		rightsib_is_rightmost;
 	int			targetlevel;
 	IndexTuple	leafhikey;
 	BlockNumber nextchild;
 
 	page = BufferGetPage(leafbuf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	Assert(P_ISLEAF(opaque) && P_ISHALFDEAD(opaque));
 
@@ -1743,7 +1743,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 		/* fetch the block number of the topmost parent's left sibling */
 		buf = _bt_getbuf(rel, target, BT_READ);
 		page = BufferGetPage(buf);
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 		leftsib = opaque->btpo_prev;
 		targetlevel = opaque->btpo.level;
 
@@ -1781,7 +1781,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	{
 		lbuf = _bt_getbuf(rel, leftsib, BT_WRITE);
 		page = BufferGetPage(lbuf);
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 		while (P_ISDELETED(opaque) || opaque->btpo_next != target)
 		{
 			/* step right one page */
@@ -1815,7 +1815,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 			}
 			lbuf = _bt_getbuf(rel, leftsib, BT_WRITE);
 			page = BufferGetPage(lbuf);
-			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+			opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 		}
 	}
 	else
@@ -1828,7 +1828,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	 */
 	LockBuffer(buf, BT_WRITE);
 	page = BufferGetPage(buf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	/*
 	 * Check page is still empty etc, else abandon deletion.  This is just for
@@ -1872,7 +1872,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	rightsib = opaque->btpo_next;
 	rbuf = _bt_getbuf(rel, rightsib, BT_WRITE);
 	page = BufferGetPage(rbuf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	if (opaque->btpo_prev != target)
 		elog(ERROR, "right sibling's left-link doesn't match: "
 			 "block %u links to %u instead of expected %u in index \"%s\"",
@@ -1896,7 +1896,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	if (leftsib == P_NONE && rightsib_is_rightmost)
 	{
 		page = BufferGetPage(rbuf);
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 		if (P_RIGHTMOST(opaque))
 		{
 			/* rightsib will be the only one left on the level */
@@ -1933,12 +1933,12 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	if (BufferIsValid(lbuf))
 	{
 		page = BufferGetPage(lbuf);
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 		Assert(opaque->btpo_next == target);
 		opaque->btpo_next = rightsib;
 	}
 	page = BufferGetPage(rbuf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	Assert(opaque->btpo_prev == target);
 	opaque->btpo_prev = leftsib;
 
@@ -1961,7 +1961,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	 * of that scan.
 	 */
 	page = BufferGetPage(buf);
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	opaque->btpo_flags &= ~BTP_HALF_DEAD;
 	opaque->btpo_flags |= BTP_DELETED;
 	opaque->btpo.xact = ReadNewTransactionId();

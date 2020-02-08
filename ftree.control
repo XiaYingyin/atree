@@ -1,0 +1,5 @@
+# ftree index extension
+comment = 'ftree implementation for pg extension'
+default_version = '0.1'
+module_pathname = '$libdir/ftree'
+relocatable = true

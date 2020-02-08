@@ -13,17 +13,16 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
 #include "access/bufmask.h"
 #include "access/heapam_xlog.h"
-#include "access/nbtree.h"
-#include "access/nbtxlog.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "storage/procarray.h"
 #include "miscadmin.h"
 
+#include "ftree.h"
+#include "ftxlog.h"
 /*
  * _bt_restore_page -- re-enter all the index tuples on a page
  *
@@ -86,7 +85,7 @@ _bt_restore_meta(XLogReaderState *record, uint8 block_id)
 	Buffer		metabuf;
 	Page		metapg;
 	BTMetaPageData *md;
-	BTPageOpaque pageop;
+	FTPageOpaque pageop;
 	xl_btree_metadata *xlrec;
 	char	   *ptr;
 	Size		len;
@@ -99,7 +98,7 @@ _bt_restore_meta(XLogReaderState *record, uint8 block_id)
 	xlrec = (xl_btree_metadata *) ptr;
 	metapg = BufferGetPage(metabuf);
 
-	_bt_pageinit(metapg, BufferGetPageSize(metabuf));
+	_ft_pageinit(metapg, BufferGetPageSize(metabuf));
 
 	md = BTPageGetMeta(metapg);
 	md->btm_magic = BTREE_MAGIC;
@@ -111,7 +110,7 @@ _bt_restore_meta(XLogReaderState *record, uint8 block_id)
 	md->btm_oldest_btpo_xact = xlrec->oldest_btpo_xact;
 	md->btm_last_cleanup_num_heap_tuples = xlrec->last_cleanup_num_heap_tuples;
 
-	pageop = (BTPageOpaque) PageGetSpecialPointer(metapg);
+	pageop = (FTPageOpaque) PageGetSpecialPointer(metapg);
 	pageop->btpo_flags = BTP_META;
 
 	/*
@@ -142,7 +141,7 @@ _bt_clear_incomplete_split(XLogReaderState *record, uint8 block_id)
 	if (XLogReadBufferForRedo(record, block_id, &buf) == BLK_NEEDS_REDO)
 	{
 		Page		page = (Page) BufferGetPage(buf);
-		BTPageOpaque pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+		FTPageOpaque pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 
 		Assert(P_INCOMPLETE_SPLIT(pageop));
 		pageop->btpo_flags &= ~BTP_INCOMPLETE_SPLIT;
@@ -210,7 +209,7 @@ btree_xlog_split(bool onleft, bool lhighkey, XLogReaderState *record)
 	Buffer		lbuf;
 	Buffer		rbuf;
 	Page		rpage;
-	BTPageOpaque ropaque;
+	FTPageOpaque ropaque;
 	char	   *datapos;
 	Size		datalen;
 	IndexTuple	left_hikey = NULL;
@@ -237,8 +236,8 @@ btree_xlog_split(bool onleft, bool lhighkey, XLogReaderState *record)
 	datapos = XLogRecGetBlockData(record, 1, &datalen);
 	rpage = (Page) BufferGetPage(rbuf);
 
-	_bt_pageinit(rpage, BufferGetPageSize(rbuf));
-	ropaque = (BTPageOpaque) PageGetSpecialPointer(rpage);
+	_ft_pageinit(rpage, BufferGetPageSize(rbuf));
+	ropaque = (FTPageOpaque) PageGetSpecialPointer(rpage);
 
 	ropaque->btpo_prev = leftsib;
 	ropaque->btpo_next = rnext;
@@ -280,7 +279,7 @@ btree_xlog_split(bool onleft, bool lhighkey, XLogReaderState *record)
 		 * the same for the right page.
 		 */
 		Page		lpage = (Page) BufferGetPage(lbuf);
-		BTPageOpaque lopaque = (BTPageOpaque) PageGetSpecialPointer(lpage);
+		FTPageOpaque lopaque = (FTPageOpaque) PageGetSpecialPointer(lpage);
 		OffsetNumber off;
 		IndexTuple	newitem = NULL;
 		Size		newitemsz = 0;
@@ -383,7 +382,7 @@ btree_xlog_split(bool onleft, bool lhighkey, XLogReaderState *record)
 		if (XLogReadBufferForRedo(record, 2, &buffer) == BLK_NEEDS_REDO)
 		{
 			Page		page = (Page) BufferGetPage(buffer);
-			BTPageOpaque pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+			FTPageOpaque pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 
 			pageop->btpo_prev = rightsib;
 
@@ -401,7 +400,7 @@ btree_xlog_vacuum(XLogReaderState *record)
 	XLogRecPtr	lsn = record->EndRecPtr;
 	Buffer		buffer;
 	Page		page;
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 #ifdef UNUSED
 	xl_btree_vacuum *xlrec = (xl_btree_vacuum *) XLogRecGetData(record);
 
@@ -427,7 +426,7 @@ btree_xlog_vacuum(XLogReaderState *record)
 	 * are any.  This prevents replay of the VACUUM from reaching the stage of
 	 * removing heap tuples while there could still be indexscans "in flight"
 	 * to those particular tuples for those scans which could be confused by
-	 * finding new tuples at the old TID locations (see nbtree/README).
+	 * finding new tuples at the old TID locations (see ftree/README).
 	 *
 	 * It might be worth checking if there are actually any backends running;
 	 * if not, we could just skip this.
@@ -480,7 +479,7 @@ btree_xlog_vacuum(XLogReaderState *record)
 
 	/*
 	 * Like in btvacuumpage(), we need to take a cleanup lock on every leaf
-	 * page. See nbtree/README for details.
+	 * page. See ftree/README for details.
 	 */
 	if (XLogReadBufferForRedoExtended(record, 0, RBM_NORMAL, true, &buffer)
 		== BLK_NEEDS_REDO)
@@ -508,7 +507,7 @@ btree_xlog_vacuum(XLogReaderState *record)
 		 * Mark the page as not containing any LP_DEAD items --- see comments
 		 * in _bt_delitems_vacuum().
 		 */
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 		opaque->btpo_flags &= ~BTP_HAS_GARBAGE;
 
 		PageSetLSN(page, lsn);
@@ -678,7 +677,7 @@ btree_xlog_delete(XLogReaderState *record)
 	xl_btree_delete *xlrec = (xl_btree_delete *) XLogRecGetData(record);
 	Buffer		buffer;
 	Page		page;
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 
 	/*
 	 * If we have any conflict processing to do, it must happen before we
@@ -703,7 +702,7 @@ btree_xlog_delete(XLogReaderState *record)
 
 	/*
 	 * We don't need to take a cleanup lock to apply these changes. See
-	 * nbtree/README for details.
+	 * ftree/README for details.
 	 */
 	if (XLogReadBufferForRedo(record, 0, &buffer) == BLK_NEEDS_REDO)
 	{
@@ -722,7 +721,7 @@ btree_xlog_delete(XLogReaderState *record)
 		 * Mark the page as not containing any LP_DEAD items --- see comments
 		 * in _bt_delitems_delete().
 		 */
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 		opaque->btpo_flags &= ~BTP_HAS_GARBAGE;
 
 		PageSetLSN(page, lsn);
@@ -739,7 +738,7 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
 	xl_btree_mark_page_halfdead *xlrec = (xl_btree_mark_page_halfdead *) XLogRecGetData(record);
 	Buffer		buffer;
 	Page		page;
-	BTPageOpaque pageop;
+	FTPageOpaque pageop;
 	IndexTupleData trunctuple;
 
 	/*
@@ -760,7 +759,7 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
 		BlockNumber rightsib;
 
 		page = (Page) BufferGetPage(buffer);
-		pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+		pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 
 		poffset = xlrec->poffset;
 
@@ -785,8 +784,8 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
 	buffer = XLogInitBufferForRedo(record, 0);
 	page = (Page) BufferGetPage(buffer);
 
-	_bt_pageinit(page, BufferGetPageSize(buffer));
-	pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+	_ft_pageinit(page, BufferGetPageSize(buffer));
+	pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	pageop->btpo_prev = xlrec->leftblk;
 	pageop->btpo_next = xlrec->rightblk;
@@ -821,7 +820,7 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 	BlockNumber rightsib;
 	Buffer		buffer;
 	Page		page;
-	BTPageOpaque pageop;
+	FTPageOpaque pageop;
 
 	leftsib = xlrec->leftsib;
 	rightsib = xlrec->rightsib;
@@ -838,7 +837,7 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 	if (XLogReadBufferForRedo(record, 2, &buffer) == BLK_NEEDS_REDO)
 	{
 		page = (Page) BufferGetPage(buffer);
-		pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+		pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 		pageop->btpo_prev = leftsib;
 
 		PageSetLSN(page, lsn);
@@ -853,7 +852,7 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 		if (XLogReadBufferForRedo(record, 1, &buffer) == BLK_NEEDS_REDO)
 		{
 			page = (Page) BufferGetPage(buffer);
-			pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+			pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 			pageop->btpo_next = rightsib;
 
 			PageSetLSN(page, lsn);
@@ -867,8 +866,8 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 	buffer = XLogInitBufferForRedo(record, 0);
 	page = (Page) BufferGetPage(buffer);
 
-	_bt_pageinit(page, BufferGetPageSize(buffer));
-	pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+	_ft_pageinit(page, BufferGetPageSize(buffer));
+	pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	pageop->btpo_prev = leftsib;
 	pageop->btpo_next = rightsib;
@@ -896,8 +895,8 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 		buffer = XLogInitBufferForRedo(record, 3);
 		page = (Page) BufferGetPage(buffer);
 
-		_bt_pageinit(page, BufferGetPageSize(buffer));
-		pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+		_ft_pageinit(page, BufferGetPageSize(buffer));
+		pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 
 		pageop->btpo_flags = BTP_HALF_DEAD | BTP_LEAF;
 		pageop->btpo_prev = xlrec->leafleftsib;
@@ -931,15 +930,15 @@ btree_xlog_newroot(XLogReaderState *record)
 	xl_btree_newroot *xlrec = (xl_btree_newroot *) XLogRecGetData(record);
 	Buffer		buffer;
 	Page		page;
-	BTPageOpaque pageop;
+	FTPageOpaque pageop;
 	char	   *ptr;
 	Size		len;
 
 	buffer = XLogInitBufferForRedo(record, 0);
 	page = (Page) BufferGetPage(buffer);
 
-	_bt_pageinit(page, BufferGetPageSize(buffer));
-	pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+	_ft_pageinit(page, BufferGetPageSize(buffer));
+	pageop = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	pageop->btpo_flags = BTP_ROOT;
 	pageop->btpo_prev = pageop->btpo_next = P_NONE;
@@ -1048,14 +1047,14 @@ void
 btree_mask(char *pagedata, BlockNumber blkno)
 {
 	Page		page = (Page) pagedata;
-	BTPageOpaque maskopaq;
+	FTPageOpaque maskopaq;
 
 	mask_page_lsn_and_checksum(page);
 
 	mask_page_hint_bits(page);
 	mask_unused_space(page);
 
-	maskopaq = (BTPageOpaque) PageGetSpecialPointer(page);
+	maskopaq = (FTPageOpaque) PageGetSpecialPointer(page);
 
 	if (P_ISDELETED(maskopaq))
 	{

@@ -19,15 +19,21 @@
 #include "access/sdir.h"
 #include "access/xlogreader.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
 #include "storage/bufmgr.h"
 #include "storage/shm_toc.h"
+//#include "nodes/relation.h"
+#include "utils/selfuncs.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
+#include "optimizer/cost.h"
 
-/* There's room for a 16-bit vacuum cycle ID in BTPageOpaqueData */
-typedef uint16 BTCycleId;
+/* There's room for a 16-bit vacuum cycle ID in FTPageOpaqueData */
+typedef uint16 FTCycleId;
 
 /*
- *	BTPageOpaqueData -- At the end of every page, we store a pointer
+ *	FTPageOpaqueData -- At the end of every page, we store a pointer
  *	to both siblings in the tree.  This is used to do forward/backward
  *	index scans.  The next-page link is also critical for recovery when
  *	a search has navigated to the wrong page due to concurrent page splits
@@ -52,7 +58,7 @@ typedef uint16 BTCycleId;
  *	instead.
  */
 
-typedef struct BTPageOpaqueData
+typedef struct FTPageOpaqueData
 {
 	BlockNumber btpo_prev;		/* left sibling, or P_NONE if leftmost */
 	BlockNumber btpo_next;		/* right sibling, or P_NONE if rightmost */
@@ -62,10 +68,10 @@ typedef struct BTPageOpaqueData
 		TransactionId xact;		/* next transaction ID, if deleted */
 	}			btpo;
 	uint16		btpo_flags;		/* flag bits, see below */
-	BTCycleId	btpo_cycleid;	/* vacuum cycle ID of latest split */
-} BTPageOpaqueData;
+	FTCycleId	btpo_cycleid;	/* vacuum cycle ID of latest split */
+} FTPageOpaqueData;
 
-typedef BTPageOpaqueData *BTPageOpaque;
+typedef FTPageOpaqueData *FTPageOpaque;
 
 /* Bits defined in btpo_flags */
 #define BTP_LEAF		(1 << 0)	/* leaf page, i.e. not internal page */
@@ -126,7 +132,7 @@ typedef struct BTMetaPageData
 #define BTMaxItemSize(page) \
 	MAXALIGN_DOWN((PageGetPageSize(page) - \
 				   MAXALIGN(SizeOfPageHeaderData + 3*sizeof(ItemIdData)) - \
-				   MAXALIGN(sizeof(BTPageOpaqueData))) / 3)
+				   MAXALIGN(sizeof(FTPageOpaqueData))) / 3)
 
 /*
  * The leaf-page fillfactor defaults to 90% but is user-adjustable.
@@ -320,7 +326,7 @@ typedef struct BTStackData
 typedef BTStackData *BTStack;
 
 /*
- * BTScanOpaqueData is the btree-private state needed for an indexscan.
+ * FTScanOpaqueData is the btree-private state needed for an indexscan.
  * This consists of preprocessed scan keys (see _bt_preprocess_keys() for
  * details of the preprocessing), information about the current location
  * of the scan, and information about the marked location, if any.  (We use
@@ -433,7 +439,7 @@ typedef struct BTArrayKeyInfo
 	Datum	   *elem_values;	/* array of num_elems Datums */
 } BTArrayKeyInfo;
 
-typedef struct BTScanOpaqueData
+typedef struct FTScanOpaqueData
 {
 	/* these fields are set by _bt_preprocess_keys(): */
 	bool		qual_ok;		/* false if qual can never be satisfied */
@@ -473,9 +479,9 @@ typedef struct BTScanOpaqueData
 	/* keep these last in struct for efficiency */
 	BTScanPosData currPos;		/* current position data */
 	BTScanPosData markPos;		/* marked position, if any */
-} BTScanOpaqueData;
+} FTScanOpaqueData;
 
-typedef BTScanOpaqueData *BTScanOpaque;
+typedef FTScanOpaqueData *FTScanOpaque;
 
 /*
  * We use some private sk_flags bits in preprocessed scan keys.  We're allowed
@@ -489,44 +495,41 @@ typedef BTScanOpaqueData *BTScanOpaque;
 #define SK_BT_NULLS_FIRST	(INDOPTION_NULLS_FIRST << SK_BT_INDOPTION_SHIFT)
 
 /*
- * external entry points for btree, in nbtree.c
+ * external entry points for ftree, in ftree.c
  */
-extern void btbuildempty(Relation index);
-extern bool btinsert(Relation rel, Datum *values, bool *isnull,
+extern void ftbuildempty(Relation index);
+extern bool ftinsert(Relation rel, Datum *values, bool *isnull,
 		 ItemPointer ht_ctid, Relation heapRel,
 		 IndexUniqueCheck checkUnique,
 		 struct IndexInfo *indexInfo);
-extern IndexScanDesc btbeginscan(Relation rel, int nkeys, int norderbys);
-extern Size btestimateparallelscan(void);
-extern void btinitparallelscan(void *target);
-extern bool btgettuple(IndexScanDesc scan, ScanDirection dir);
-extern int64 btgetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
-extern void btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+extern IndexScanDesc ftbeginscan(Relation rel, int nkeys, int norderbys);
+extern bool ftgettuple(IndexScanDesc scan, ScanDirection dir);
+extern int64 ftgetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
+extern void ftrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		 ScanKey orderbys, int norderbys);
-extern void btparallelrescan(IndexScanDesc scan);
-extern void btendscan(IndexScanDesc scan);
-extern void btmarkpos(IndexScanDesc scan);
-extern void btrestrpos(IndexScanDesc scan);
-extern IndexBulkDeleteResult *btbulkdelete(IndexVacuumInfo *info,
+extern void ftendscan(IndexScanDesc scan);
+extern void ftmarkpos(IndexScanDesc scan);
+extern void ftrestrpos(IndexScanDesc scan);
+extern IndexBulkDeleteResult *ftbulkdelete(IndexVacuumInfo *info,
 			 IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback,
 			 void *callback_state);
-extern IndexBulkDeleteResult *btvacuumcleanup(IndexVacuumInfo *info,
+extern IndexBulkDeleteResult *ftvacuumcleanup(IndexVacuumInfo *info,
 				IndexBulkDeleteResult *stats);
-extern bool btcanreturn(Relation index, int attno);
-
-/*
- * prototypes for internal functions in nbtree.c
- */
-extern bool _bt_parallel_seize(IndexScanDesc scan, BlockNumber *pageno);
-extern void _bt_parallel_release(IndexScanDesc scan, BlockNumber scan_page);
-extern void _bt_parallel_done(IndexScanDesc scan);
-extern void _bt_parallel_advance_array_keys(IndexScanDesc scan);
+extern bool ftcanreturn(Relation index, int attno);
+extern void ftcostestimate(struct PlannerInfo *root,
+			   struct IndexPath *path,
+			   double loop_count,
+			   Cost *indexStartupCost,
+			   Cost *indexTotalCost,
+			   Selectivity *indexSelectivity,
+			   double *indexCorrelation,
+			   double *indexPages);
 
 /*
  * prototypes for functions in nbtinsert.c
  */
-extern bool _bt_doinsert(Relation rel, IndexTuple itup,
+extern bool _ft_doinsert(Relation rel, IndexTuple itup,
 			 IndexUniqueCheck checkUnique, Relation heapRel);
 extern Buffer _bt_getstackbuf(Relation rel, BTStack stack, int access);
 extern void _bt_finish_split(Relation rel, Buffer bbuf, BTStack stack);
@@ -534,7 +537,7 @@ extern void _bt_finish_split(Relation rel, Buffer bbuf, BTStack stack);
 /*
  * prototypes for functions in nbtpage.c
  */
-extern void _bt_initmetapage(Page page, BlockNumber rootbknum, uint32 level);
+extern void _ft_initmetapage(Page page, BlockNumber rootbknum, uint32 level);
 extern void _bt_update_meta_cleanup_info(Relation rel,
 							 TransactionId oldestBtpoXact, float8 numHeapTuples);
 extern void _bt_upgrademetapage(Page page);
@@ -546,7 +549,7 @@ extern Buffer _bt_getbuf(Relation rel, BlockNumber blkno, int access);
 extern Buffer _bt_relandgetbuf(Relation rel, Buffer obuf,
 				 BlockNumber blkno, int access);
 extern void _bt_relbuf(Relation rel, Buffer buf);
-extern void _bt_pageinit(Page page, Size size);
+extern void _ft_pageinit(Page page, Size size);
 extern bool _bt_page_recyclable(Page page);
 extern void _bt_delitems_delete(Relation rel, Buffer buf,
 					OffsetNumber *itemnos, int nitems, Relation heapRel);
@@ -583,36 +586,35 @@ extern void _bt_freestack(BTStack stack);
 extern void _bt_preprocess_array_keys(IndexScanDesc scan);
 extern void _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir);
 extern bool _bt_advance_array_keys(IndexScanDesc scan, ScanDirection dir);
-extern void _bt_mark_array_keys(IndexScanDesc scan);
+extern void _ft_mark_array_keys(IndexScanDesc scan);
 extern void _bt_restore_array_keys(IndexScanDesc scan);
 extern void _bt_preprocess_keys(IndexScanDesc scan);
 extern IndexTuple _bt_checkkeys(IndexScanDesc scan,
 			  Page page, OffsetNumber offnum,
 			  ScanDirection dir, bool *continuescan);
 extern void _bt_killitems(IndexScanDesc scan);
-extern BTCycleId _bt_vacuum_cycleid(Relation rel);
-extern BTCycleId _bt_start_vacuum(Relation rel);
+extern FTCycleId _bt_vacuum_cycleid(Relation rel);
+extern FTCycleId _bt_start_vacuum(Relation rel);
 extern void _bt_end_vacuum(Relation rel);
 extern void _bt_end_vacuum_callback(int code, Datum arg);
 extern Size BTreeShmemSize(void);
 extern void BTreeShmemInit(void);
-extern bytea *btoptions(Datum reloptions, bool validate);
-extern bool btproperty(Oid index_oid, int attno,
+extern bytea *ftoptions(Datum reloptions, bool validate);
+extern bool ftproperty(Oid index_oid, int attno,
 		   IndexAMProperty prop, const char *propname,
 		   bool *res, bool *isnull);
 extern IndexTuple _bt_nonkey_truncate(Relation rel, IndexTuple itup);
 extern bool _bt_check_natts(Relation rel, Page page, OffsetNumber offnum);
 
 /*
- * prototypes for functions in nbtvalidate.c
+ * prototypes for functions in ftvalidate.c
  */
-extern bool btvalidate(Oid opclassoid);
+extern bool ftvalidate(Oid opclassoid);
 
 /*
  * prototypes for functions in nbtsort.c
  */
-extern IndexBuildResult *btbuild(Relation heap, Relation index,
+extern IndexBuildResult *ftbuild(Relation heap, Relation index,
 		struct IndexInfo *indexInfo);
-extern void _bt_parallel_build_main(dsm_segment *seg, shm_toc *toc);
 
 #endif							/* NBTREE_H */

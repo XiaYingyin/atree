@@ -16,10 +16,8 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <math.h>
 #include "postgres.h"
-
-#include "nbtree.h"
-#include "access/nbtxlog.h"
 #include "access/relscan.h"
 #include "access/xlog.h"
 #include "commands/vacuum.h"
@@ -36,74 +34,40 @@
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
 
+#include "ftree.h"
+#include "ftxlog.h"
 
-/* Working state needed by btvacuumpage */
+/* Working state needed by ftvacuumpage */
 typedef struct
 {
 	IndexVacuumInfo *info;
 	IndexBulkDeleteResult *stats;
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
-	BTCycleId	cycleid;
+	FTCycleId	cycleid;
 	BlockNumber lastBlockVacuumed;	/* highest blkno actually vacuumed */
 	BlockNumber lastBlockLocked;	/* highest blkno we've cleanup-locked */
 	BlockNumber totFreePages;	/* true total # of free pages */
 	TransactionId oldestBtpoXact;
 	MemoryContext pagedelcontext;
-} BTVacState;
-
-/*
- * BTPARALLEL_NOT_INITIALIZED indicates that the scan has not started.
- *
- * BTPARALLEL_ADVANCING indicates that some process is advancing the scan to
- * a new page; others must wait.
- *
- * BTPARALLEL_IDLE indicates that no backend is currently advancing the scan
- * to a new page; some process can start doing that.
- *
- * BTPARALLEL_DONE indicates that the scan is complete (including error exit).
- * We reach this state once for every distinct combination of array keys.
- */
-typedef enum
-{
-	BTPARALLEL_NOT_INITIALIZED,
-	BTPARALLEL_ADVANCING,
-	BTPARALLEL_IDLE,
-	BTPARALLEL_DONE
-} BTPS_State;
-
-/*
- * BTParallelScanDescData contains btree specific shared information required
- * for parallel scan.
- */
-typedef struct BTParallelScanDescData
-{
-	BlockNumber btps_scanPage;	/* latest or next page to be scanned */
-	BTPS_State	btps_pageStatus;	/* indicates whether next page is
-									 * available for scan. see above for
-									 * possible states of parallel scan. */
-	int			btps_arrayKeyCount; /* count indicating number of array scan
-									 * keys processed by parallel scan */
-	slock_t		btps_mutex;		/* protects above variables */
-	ConditionVariable btps_cv;	/* used to synchronize parallel scan */
-}			BTParallelScanDescData;
-
-typedef struct BTParallelScanDescData *BTParallelScanDesc;
+} FTVacState;
 
 
-static void btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+
+static void ftvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback, void *callback_state,
-			 BTCycleId cycleid, TransactionId *oldestBtpoXact);
-static void btvacuumpage(BTVacState *vstate, BlockNumber blkno,
+			 FTCycleId cycleid, TransactionId *oldestBtpoXact);
+static void ftvacuumpage(FTVacState *vstate, BlockNumber blkno,
 			 BlockNumber orig_blkno);
 
+static List *add_predicate_to_quals(IndexOptInfo *index, List *indexQuals);
 
 /*
  * Btree handler function: return IndexAmRoutine with access method parameters
  * and callbacks.
  */
 Datum
-bthandler(PG_FUNCTION_ARGS)
+fthandler(PG_FUNCTION_ARGS)
 {
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
@@ -120,45 +84,42 @@ bthandler(PG_FUNCTION_ARGS)
 	amroutine->amstorage = false;
 	amroutine->amclusterable = true;
 	amroutine->ampredlocks = true;
-	amroutine->amcanparallel = true;
+	amroutine->amcanparallel = false;
 	amroutine->amcaninclude = true;
 	amroutine->amkeytype = InvalidOid;
 
-	amroutine->ambuild = btbuild;
-	amroutine->ambuildempty = btbuildempty;
-	amroutine->aminsert = btinsert;
-	amroutine->ambulkdelete = btbulkdelete;
-	amroutine->amvacuumcleanup = btvacuumcleanup;
-	amroutine->amcanreturn = btcanreturn;
-	amroutine->amcostestimate = btcostestimate;
-	amroutine->amoptions = btoptions;
-	amroutine->amproperty = btproperty;
-	amroutine->amvalidate = btvalidate;
-	amroutine->ambeginscan = btbeginscan;
-	amroutine->amrescan = btrescan;
-	amroutine->amgettuple = btgettuple;
-	amroutine->amgetbitmap = btgetbitmap;
-	amroutine->amendscan = btendscan;
-	amroutine->ammarkpos = btmarkpos;
-	amroutine->amrestrpos = btrestrpos;
-	amroutine->amestimateparallelscan = btestimateparallelscan;
-	amroutine->aminitparallelscan = btinitparallelscan;
-	amroutine->amparallelrescan = btparallelrescan;
+	amroutine->ambuild = ftbuild;
+	amroutine->ambuildempty = ftbuildempty;
+	amroutine->aminsert = ftinsert;
+	amroutine->ambulkdelete = ftbulkdelete;
+	amroutine->amvacuumcleanup = ftvacuumcleanup;
+	amroutine->amcanreturn = ftcanreturn;
+	amroutine->amcostestimate = ftcostestimate;
+	amroutine->amoptions = ftoptions;
+	amroutine->amproperty = ftproperty;
+	amroutine->amvalidate = ftvalidate;
+	amroutine->ambeginscan = ftbeginscan;
+	amroutine->amrescan = ftrescan;
+	amroutine->amgettuple = ftgettuple;
+	amroutine->amgetbitmap = ftgetbitmap;
+	amroutine->amendscan = ftendscan;
+	amroutine->ammarkpos = ftmarkpos;
+	amroutine->amrestrpos = ftrestrpos;
 
 	PG_RETURN_POINTER(amroutine);
 }
 
 /*
- *	btbuildempty() -- build an empty btree index in the initialization fork
+ *	ftbuildempty() -- build an empty ftree index in the initialization fork
  */
 void
-btbuildempty(Relation index)
+ftbuildempty(Relation index)
 {
 	Page		metapage;
 
 	/* Construct metapage. */
 	metapage = (Page) palloc(BLCKSZ);
-	_bt_initmetapage(metapage, P_NONE, 0);
+	_ft_initmetapage(metapage, P_NONE, 0);
 
 	/*
 	 * Write the page and log it.  It might seem that an immediate sync would
@@ -182,13 +143,13 @@ btbuildempty(Relation index)
 }
 
 /*
- *	btinsert() -- insert an index tuple into a btree.
+ *	ftinsert() -- insert an index tuple into a btree.
  *
  *		Descend the tree recursively, find the appropriate location for our
  *		new tuple, and put it there.
  */
 bool
-btinsert(Relation rel, Datum *values, bool *isnull,
+ftinsert(Relation rel, Datum *values, bool *isnull,
 		 ItemPointer ht_ctid, Relation heapRel,
 		 IndexUniqueCheck checkUnique,
 		 IndexInfo *indexInfo)
@@ -200,7 +161,7 @@ btinsert(Relation rel, Datum *values, bool *isnull,
 	itup = index_form_tuple(RelationGetDescr(rel), values, isnull);
 	itup->t_tid = *ht_ctid;
 
-	result = _bt_doinsert(rel, itup, checkUnique, heapRel);
+	result = _ft_doinsert(rel, itup, checkUnique, heapRel);
 
 	pfree(itup);
 
@@ -208,19 +169,19 @@ btinsert(Relation rel, Datum *values, bool *isnull,
 }
 
 /*
- *	btgettuple() -- Get the next tuple in the scan.
+ *	ftgettuple() -- Get the next tuple in the scan.
  */
 bool
-btgettuple(IndexScanDesc scan, ScanDirection dir)
+ftgettuple(IndexScanDesc scan, ScanDirection dir)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	bool		res;
 
 	/* btree indexes are never lossy */
 	scan->xs_recheck = false;
 
 	/*
-	 * If we have any array keys, initialize them during first call for a
+	 * If we have any array keys, initialize them during t call for a
 	 * scan.  We can't do this in btrescan because we don't know the scan
 	 * direction at that time.
 	 */
@@ -282,12 +243,12 @@ btgettuple(IndexScanDesc scan, ScanDirection dir)
 }
 
 /*
- * btgetbitmap() -- gets all matching tuples, and adds them to a bitmap
+ * ftgetbitmap() -- gets all matching tuples, and adds them to a bitmap
  */
 int64
-btgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+ftgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	int64		ntids = 0;
 	ItemPointer heapTid;
 
@@ -343,10 +304,10 @@ btgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
  *	btbeginscan() -- start a scan on a btree index
  */
 IndexScanDesc
-btbeginscan(Relation rel, int nkeys, int norderbys)
+ftbeginscan(Relation rel, int nkeys, int norderbys)
 {
 	IndexScanDesc scan;
-	BTScanOpaque so;
+	FTScanOpaque so;
 
 	/* no order by operators allowed */
 	Assert(norderbys == 0);
@@ -355,7 +316,7 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
 	/* allocate private workspace */
-	so = (BTScanOpaque) palloc(sizeof(BTScanOpaqueData));
+	so = (FTScanOpaque) palloc(sizeof(FTScanOpaqueData));
 	BTScanPosInvalidate(so->currPos);
 	BTScanPosInvalidate(so->markPos);
 	if (scan->numberOfKeys > 0)
@@ -389,10 +350,10 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
  *	btrescan() -- rescan an index relation
  */
 void
-btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+ftrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		 ScanKey orderbys, int norderbys)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 
 	/* we aren't holding any read locks, but gotta drop the pins */
 	if (BTScanPosIsValid(so->currPos))
@@ -449,9 +410,9 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
  *	btendscan() -- close down a scan
  */
 void
-btendscan(IndexScanDesc scan)
+ftendscan(IndexScanDesc scan)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 
 	/* we aren't holding any read locks, but gotta drop the pins */
 	if (BTScanPosIsValid(so->currPos))
@@ -485,9 +446,9 @@ btendscan(IndexScanDesc scan)
  *	btmarkpos() -- save current scan position
  */
 void
-btmarkpos(IndexScanDesc scan)
+ftmarkpos(IndexScanDesc scan)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 
 	/* There may be an old mark with a pin (but no lock). */
 	BTScanPosUnpinIfPinned(so->markPos);
@@ -508,16 +469,16 @@ btmarkpos(IndexScanDesc scan)
 
 	/* Also record the current positions of any array keys */
 	if (so->numArrayKeys)
-		_bt_mark_array_keys(scan);
+		_ft_mark_array_keys(scan);
 }
 
 /*
- *	btrestrpos() -- restore scan to last saved position
+ *	ftrestrpos() -- restore scan to last saved position
  */
 void
-btrestrpos(IndexScanDesc scan)
+ftrestrpos(IndexScanDesc scan)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 
 	/* Restore the marked positions of any array keys */
 	if (so->numArrayKeys)
@@ -567,216 +528,6 @@ btrestrpos(IndexScanDesc scan)
 	}
 }
 
-/*
- * btestimateparallelscan -- estimate storage for BTParallelScanDescData
- */
-Size
-btestimateparallelscan(void)
-{
-	return sizeof(BTParallelScanDescData);
-}
-
-/*
- * btinitparallelscan -- initialize BTParallelScanDesc for parallel btree scan
- */
-void
-btinitparallelscan(void *target)
-{
-	BTParallelScanDesc bt_target = (BTParallelScanDesc) target;
-
-	SpinLockInit(&bt_target->btps_mutex);
-	bt_target->btps_scanPage = InvalidBlockNumber;
-	bt_target->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
-	bt_target->btps_arrayKeyCount = 0;
-	ConditionVariableInit(&bt_target->btps_cv);
-}
-
-/*
- *	btparallelrescan() -- reset parallel scan
- */
-void
-btparallelrescan(IndexScanDesc scan)
-{
-	BTParallelScanDesc btscan;
-	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
-
-	Assert(parallel_scan);
-
-	btscan = (BTParallelScanDesc) OffsetToPointer((void *) parallel_scan,
-												  parallel_scan->ps_offset);
-
-	/*
-	 * In theory, we don't need to acquire the spinlock here, because there
-	 * shouldn't be any other workers running at this point, but we do so for
-	 * consistency.
-	 */
-	SpinLockAcquire(&btscan->btps_mutex);
-	btscan->btps_scanPage = InvalidBlockNumber;
-	btscan->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
-	btscan->btps_arrayKeyCount = 0;
-	SpinLockRelease(&btscan->btps_mutex);
-}
-
-/*
- * _bt_parallel_seize() -- Begin the process of advancing the scan to a new
- *		page.  Other scans must wait until we call bt_parallel_release() or
- *		bt_parallel_done().
- *
- * The return value is true if we successfully seized the scan and false
- * if we did not.  The latter case occurs if no pages remain for the current
- * set of scankeys.
- *
- * If the return value is true, *pageno returns the next or current page
- * of the scan (depending on the scan direction).  An invalid block number
- * means the scan hasn't yet started, and P_NONE means we've reached the end.
- * The first time a participating process reaches the last page, it will return
- * true and set *pageno to P_NONE; after that, further attempts to seize the
- * scan will return false.
- *
- * Callers should ignore the value of pageno if the return value is false.
- */
-bool
-_bt_parallel_seize(IndexScanDesc scan, BlockNumber *pageno)
-{
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	BTPS_State	pageStatus;
-	bool		exit_loop = false;
-	bool		status = true;
-	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
-	BTParallelScanDesc btscan;
-
-	*pageno = P_NONE;
-
-	btscan = (BTParallelScanDesc) OffsetToPointer((void *) parallel_scan,
-												  parallel_scan->ps_offset);
-
-	while (1)
-	{
-		SpinLockAcquire(&btscan->btps_mutex);
-		pageStatus = btscan->btps_pageStatus;
-
-		if (so->arrayKeyCount < btscan->btps_arrayKeyCount)
-		{
-			/* Parallel scan has already advanced to a new set of scankeys. */
-			status = false;
-		}
-		else if (pageStatus == BTPARALLEL_DONE)
-		{
-			/*
-			 * We're done with this set of scankeys.  This may be the end, or
-			 * there could be more sets to try.
-			 */
-			status = false;
-		}
-		else if (pageStatus != BTPARALLEL_ADVANCING)
-		{
-			/*
-			 * We have successfully seized control of the scan for the purpose
-			 * of advancing it to a new page!
-			 */
-			btscan->btps_pageStatus = BTPARALLEL_ADVANCING;
-			*pageno = btscan->btps_scanPage;
-			exit_loop = true;
-		}
-		SpinLockRelease(&btscan->btps_mutex);
-		if (exit_loop || !status)
-			break;
-		ConditionVariableSleep(&btscan->btps_cv, WAIT_EVENT_BTREE_PAGE);
-	}
-	ConditionVariableCancelSleep();
-
-	return status;
-}
-
-/*
- * _bt_parallel_release() -- Complete the process of advancing the scan to a
- *		new page.  We now have the new value btps_scanPage; some other backend
- *		can now begin advancing the scan.
- */
-void
-_bt_parallel_release(IndexScanDesc scan, BlockNumber scan_page)
-{
-	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
-	BTParallelScanDesc btscan;
-
-	btscan = (BTParallelScanDesc) OffsetToPointer((void *) parallel_scan,
-												  parallel_scan->ps_offset);
-
-	SpinLockAcquire(&btscan->btps_mutex);
-	btscan->btps_scanPage = scan_page;
-	btscan->btps_pageStatus = BTPARALLEL_IDLE;
-	SpinLockRelease(&btscan->btps_mutex);
-	ConditionVariableSignal(&btscan->btps_cv);
-}
-
-/*
- * _bt_parallel_done() -- Mark the parallel scan as complete.
- *
- * When there are no pages left to scan, this function should be called to
- * notify other workers.  Otherwise, they might wait forever for the scan to
- * advance to the next page.
- */
-void
-_bt_parallel_done(IndexScanDesc scan)
-{
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
-	BTParallelScanDesc btscan;
-	bool		status_changed = false;
-
-	/* Do nothing, for non-parallel scans */
-	if (parallel_scan == NULL)
-		return;
-
-	btscan = (BTParallelScanDesc) OffsetToPointer((void *) parallel_scan,
-												  parallel_scan->ps_offset);
-
-	/*
-	 * Mark the parallel scan as done for this combination of scan keys,
-	 * unless some other process already did so.  See also
-	 * _bt_advance_array_keys.
-	 */
-	SpinLockAcquire(&btscan->btps_mutex);
-	if (so->arrayKeyCount >= btscan->btps_arrayKeyCount &&
-		btscan->btps_pageStatus != BTPARALLEL_DONE)
-	{
-		btscan->btps_pageStatus = BTPARALLEL_DONE;
-		status_changed = true;
-	}
-	SpinLockRelease(&btscan->btps_mutex);
-
-	/* wake up all the workers associated with this parallel scan */
-	if (status_changed)
-		ConditionVariableBroadcast(&btscan->btps_cv);
-}
-
-/*
- * _bt_parallel_advance_array_keys() -- Advances the parallel scan for array
- *			keys.
- *
- * Updates the count of array keys processed for both local and parallel
- * scans.
- */
-void
-_bt_parallel_advance_array_keys(IndexScanDesc scan)
-{
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
-	BTParallelScanDesc btscan;
-
-	btscan = (BTParallelScanDesc) OffsetToPointer((void *) parallel_scan,
-												  parallel_scan->ps_offset);
-
-	so->arrayKeyCount++;
-	SpinLockAcquire(&btscan->btps_mutex);
-	if (btscan->btps_pageStatus == BTPARALLEL_DONE)
-	{
-		btscan->btps_scanPage = InvalidBlockNumber;
-		btscan->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
-		btscan->btps_arrayKeyCount++;
-	}
-	SpinLockRelease(&btscan->btps_mutex);
-}
 
 /*
  * _bt_vacuum_needs_cleanup() -- Checks if index needs cleanup assuming that
@@ -851,11 +602,11 @@ _bt_vacuum_needs_cleanup(IndexVacuumInfo *info)
  * Result: a palloc'd struct containing statistical info for VACUUM displays.
  */
 IndexBulkDeleteResult *
-btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ftbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback, void *callback_state)
 {
 	Relation	rel = info->index;
-	BTCycleId	cycleid;
+	FTCycleId	cycleid;
 
 	/* allocate stats if first time through, else re-use existing struct */
 	if (stats == NULL)
@@ -869,7 +620,7 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 		cycleid = _bt_start_vacuum(rel);
 
-		btvacuumscan(info, stats, callback, callback_state, cycleid,
+		ftvacuumscan(info, stats, callback, callback_state, cycleid,
 					 &oldestBtpoXact);
 
 		/*
@@ -892,7 +643,7 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
  * Result: a palloc'd struct containing statistical info for VACUUM displays.
  */
 IndexBulkDeleteResult *
-btvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+ftvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
 	/* No-op in ANALYZE ONLY mode */
 	if (info->analyze_only)
@@ -917,7 +668,7 @@ btvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			return NULL;
 
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-		btvacuumscan(info, stats, NULL, NULL, 0, &oldestBtpoXact);
+		ftvacuumscan(info, stats, NULL, NULL, 0, &oldestBtpoXact);
 
 		/* Update cleanup-related information in the metapage */
 		_bt_update_meta_cleanup_info(info->index, oldestBtpoXact,
@@ -940,7 +691,7 @@ btvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 }
 
 /*
- * btvacuumscan --- scan the index for VACUUMing purposes
+ * ftvacuumscan --- scan the index for VACUUMing purposes
  *
  * This combines the functions of looking for leaf tuples that are deletable
  * according to the vacuum callback, looking for empty pages that can be
@@ -952,12 +703,12 @@ btvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  * and for obtaining a vacuum cycle ID if necessary.
  */
 static void
-btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ftvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback, void *callback_state,
-			 BTCycleId cycleid, TransactionId *oldestBtpoXact)
+			 FTCycleId cycleid, TransactionId *oldestBtpoXact)
 {
 	Relation	rel = info->index;
-	BTVacState	vstate;
+	FTVacState	vstate;
 	BlockNumber num_pages;
 	BlockNumber blkno;
 	bool		needLock;
@@ -970,7 +721,7 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	stats->num_index_tuples = 0;
 	stats->pages_deleted = 0;
 
-	/* Set up info to pass down to btvacuumpage */
+	/* Set up info to pass down to ftvacuumpage */
 	vstate.info = info;
 	vstate.stats = stats;
 	vstate.callback = callback;
@@ -1027,7 +778,7 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		/* Iterate over pages, then loop back to recheck length */
 		for (; blkno < num_pages; blkno++)
 		{
-			btvacuumpage(&vstate, blkno, blkno);
+			ftvacuumpage(&vstate, blkno, blkno);
 		}
 	}
 
@@ -1090,18 +841,18 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 }
 
 /*
- * btvacuumpage --- VACUUM one page
+ * ftvacuumpage --- VACUUM one page
  *
- * This processes a single page for btvacuumscan().  In some cases we
+ * This processes a single page for ftvacuumscan().  In some cases we
  * must go back and re-examine previously-scanned pages; this routine
  * recurses when necessary to handle that case.
  *
  * blkno is the page to process.  orig_blkno is the highest block number
- * reached by the outer btvacuumscan loop (the same as blkno, unless we
+ * reached by the outer ftvacuumscan loop (the same as blkno, unless we
  * are recursing to re-examine a previous page).
  */
 static void
-btvacuumpage(BTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ftvacuumpage(FTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
 {
 	IndexVacuumInfo *info = vstate->info;
 	IndexBulkDeleteResult *stats = vstate->stats;
@@ -1112,7 +863,7 @@ btvacuumpage(BTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
 	BlockNumber recurse_to;
 	Buffer		buf;
 	Page		page;
-	BTPageOpaque opaque = NULL;
+	FTPageOpaque opaque = NULL;
 
 restart:
 	delete_now = false;
@@ -1134,7 +885,7 @@ restart:
 	if (!PageIsNew(page))
 	{
 		_bt_checkpage(rel, buf);
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	}
 
 	/*
@@ -1196,7 +947,7 @@ restart:
 
 		/*
 		 * Remember highest leaf page number we've taken cleanup lock on; see
-		 * notes in btvacuumscan
+		 * notes in ftvacuumscan
 		 */
 		if (blkno > vstate->lastBlockLocked)
 			vstate->lastBlockLocked = blkno;
@@ -1372,7 +1123,321 @@ restart:
  * btrees always do, so this is trivial.
  */
 bool
-btcanreturn(Relation index, int attno)
+ftcanreturn(Relation index, int attno)
 {
 	return true;
+}
+
+static List *
+add_predicate_to_quals(IndexOptInfo *index, List *indexQuals)
+{
+	List	   *predExtraQuals = NIL;
+	ListCell   *lc;
+
+	if (index->indpred == NIL)
+		return indexQuals;
+
+	foreach(lc, index->indpred)
+	{
+		Node	   *predQual = (Node *) lfirst(lc);
+		List	   *oneQual = list_make1(predQual);
+
+//		if (!predicate_implied_by(oneQual, indexQuals, false))
+			predExtraQuals = list_concat(predExtraQuals, oneQual);
+	}
+	/* list_concat avoids modifying the passed-in indexQuals list */
+	return list_concat(predExtraQuals, indexQuals);
+}
+
+void
+ftcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+			   Cost *indexStartupCost, Cost *indexTotalCost,
+			   Selectivity *indexSelectivity, double *indexCorrelation,
+			   double *indexPages)
+{
+	IndexOptInfo *index = path->indexinfo;
+	List	   *qinfos;
+	GenericCosts costs;
+	Oid			relid;
+	AttrNumber	colnum;
+	VariableStatData vardata;
+	double		numIndexTuples;
+	Cost		descentCost;
+	List	   *indexBoundQuals;
+	int			indexcol;
+	bool		eqQualHere;
+	bool		found_saop;
+	bool		found_is_null_op;
+	double		num_sa_scans;
+	ListCell   *lc;
+
+	/* Do preliminary analysis of indexquals */
+	qinfos = deconstruct_indexquals(path);
+
+	/*
+	 * For a btree scan, only leading '=' quals plus inequality quals for the
+	 * immediately next attribute contribute to index selectivity (these are
+	 * the "boundary quals" that determine the starting and stopping points of
+	 * the index scan).  Additional quals can suppress visits to the heap, so
+	 * it's OK to count them in indexSelectivity, but they should not count
+	 * for estimating numIndexTuples.  So we must examine the given indexquals
+	 * to find out which ones count as boundary quals.  We rely on the
+	 * knowledge that they are given in index column order.
+	 *
+	 * For a RowCompareExpr, we consider only the first column, just as
+	 * rowcomparesel() does.
+	 *
+	 * If there's a ScalarArrayOpExpr in the quals, we'll actually perform N
+	 * index scans not one, but the ScalarArrayOpExpr's operator can be
+	 * considered to act the same as it normally does.
+	 */
+	indexBoundQuals = NIL;
+	indexcol = 0;
+	eqQualHere = false;
+	found_saop = false;
+	found_is_null_op = false;
+	num_sa_scans = 1;
+	foreach(lc, qinfos)
+	{
+		IndexQualInfo *qinfo = (IndexQualInfo *) lfirst(lc);
+		RestrictInfo *rinfo = qinfo->rinfo;
+		Expr	   *clause = rinfo->clause;
+		Oid			clause_op;
+		int			op_strategy;
+
+		if (indexcol != qinfo->indexcol)
+		{
+			/* Beginning of a new column's quals */
+			if (!eqQualHere)
+				break;			/* done if no '=' qual for indexcol */
+			eqQualHere = false;
+			indexcol++;
+			if (indexcol != qinfo->indexcol)
+				break;			/* no quals at all for indexcol */
+		}
+
+		if (IsA(clause, ScalarArrayOpExpr))
+		{
+			int			alength = estimate_array_length(qinfo->other_operand);
+
+			found_saop = true;
+			/* count up number of SA scans induced by indexBoundQuals only */
+			if (alength > 1)
+				num_sa_scans *= alength;
+		}
+		else if (IsA(clause, NullTest))
+		{
+			NullTest   *nt = (NullTest *) clause;
+
+			if (nt->nulltesttype == IS_NULL)
+			{
+				found_is_null_op = true;
+				/* IS NULL is like = for selectivity determination purposes */
+				eqQualHere = true;
+			}
+		}
+
+		/*
+		 * We would need to commute the clause_op if not varonleft, except
+		 * that we only care if it's equality or not, so that refinement is
+		 * unnecessary.
+		 */
+		clause_op = qinfo->clause_op;
+
+		/* check for equality operator */
+		if (OidIsValid(clause_op))
+		{
+			op_strategy = get_op_opfamily_strategy(clause_op,
+												   index->opfamily[indexcol]);
+			Assert(op_strategy != 0);	/* not a member of opfamily?? */
+			if (op_strategy == BTEqualStrategyNumber)
+				eqQualHere = true;
+		}
+
+		indexBoundQuals = lappend(indexBoundQuals, rinfo);
+	}
+
+	/*
+	 * If index is unique and we found an '=' clause for each column, we can
+	 * just assume numIndexTuples = 1 and skip the expensive
+	 * clauselist_selectivity calculations.  However, a ScalarArrayOp or
+	 * NullTest invalidates that theory, even though it sets eqQualHere.
+	 */
+	if (index->unique &&
+		indexcol == index->nkeycolumns - 1 &&
+		eqQualHere &&
+		!found_saop &&
+		!found_is_null_op)
+		numIndexTuples = 1.0;
+	else
+	{
+		List	   *selectivityQuals;
+		Selectivity btreeSelectivity;
+
+		/*
+		 * If the index is partial, AND the index predicate with the
+		 * index-bound quals to produce a more accurate idea of the number of
+		 * rows covered by the bound conditions.
+		 */
+		selectivityQuals = add_predicate_to_quals(index, indexBoundQuals);
+
+		btreeSelectivity = clauselist_selectivity(root, selectivityQuals,
+												  index->rel->relid,
+												  JOIN_INNER,
+												  NULL);
+		numIndexTuples = btreeSelectivity * index->rel->tuples;
+
+		/*
+		 * As in genericcostestimate(), we have to adjust for any
+		 * ScalarArrayOpExpr quals included in indexBoundQuals, and then round
+		 * to integer.
+		 */
+		numIndexTuples = rint(numIndexTuples / num_sa_scans);
+	}
+
+	/*
+	 * Now do generic index cost estimation.
+	 */
+	MemSet(&costs, 0, sizeof(costs));
+	costs.numIndexTuples = numIndexTuples;
+
+	genericcostestimate(root, path, loop_count, qinfos, &costs);
+
+	/*
+	 * Add a CPU-cost component to represent the costs of initial btree
+	 * descent.  We don't charge any I/O cost for touching upper btree levels,
+	 * since they tend to stay in cache, but we still have to do about log2(N)
+	 * comparisons to descend a btree of N leaf tuples.  We charge one
+	 * cpu_operator_cost per comparison.
+	 *
+	 * If there are ScalarArrayOpExprs, charge this once per SA scan.  The
+	 * ones after the first one are not startup cost so far as the overall
+	 * plan is concerned, so add them only to "total" cost.
+	 */
+	if (index->tuples > 1)		/* avoid computing log(0) */
+	{
+		descentCost = ceil(log(index->tuples) / log(2.0)) * cpu_operator_cost;
+		costs.indexStartupCost += descentCost;
+		costs.indexTotalCost += costs.num_sa_scans * descentCost;
+	}
+
+	/*
+	 * Even though we're not charging I/O cost for touching upper btree pages,
+	 * it's still reasonable to charge some CPU cost per page descended
+	 * through.  Moreover, if we had no such charge at all, bloated indexes
+	 * would appear to have the same search cost as unbloated ones, at least
+	 * in cases where only a single leaf page is expected to be visited.  This
+	 * cost is somewhat arbitrarily set at 50x cpu_operator_cost per page
+	 * touched.  The number of such pages is btree tree height plus one (ie,
+	 * we charge for the leaf page too).  As above, charge once per SA scan.
+	 */
+	descentCost = (index->tree_height + 1) * 50.0 * cpu_operator_cost;
+	costs.indexStartupCost += descentCost;
+	costs.indexTotalCost += costs.num_sa_scans * descentCost;
+
+	/*
+	 * If we can get an estimate of the first column's ordering correlation C
+	 * from pg_statistic, estimate the index correlation as C for a
+	 * single-column index, or C * 0.75 for multiple columns. (The idea here
+	 * is that multiple columns dilute the importance of the first column's
+	 * ordering, but don't negate it entirely.  Before 8.0 we divided the
+	 * correlation by the number of columns, but that seems too strong.)
+	 */
+	MemSet(&vardata, 0, sizeof(vardata));
+
+	if (index->indexkeys[0] != 0)
+	{
+		/* Simple variable --- look to stats for the underlying table */
+		RangeTblEntry *rte = planner_rt_fetch(index->rel->relid, root);
+
+		Assert(rte->rtekind == RTE_RELATION);
+		relid = rte->relid;
+		Assert(relid != InvalidOid);
+		colnum = index->indexkeys[0];
+
+		if (get_relation_stats_hook &&
+			(*get_relation_stats_hook) (root, rte, colnum, &vardata))
+		{
+			/*
+			 * The hook took control of acquiring a stats tuple.  If it did
+			 * supply a tuple, it'd better have supplied a freefunc.
+			 */
+			if (HeapTupleIsValid(vardata.statsTuple) &&
+				!vardata.freefunc)
+				elog(ERROR, "no function provided to release variable stats with");
+		}
+		else
+		{
+			vardata.statsTuple = SearchSysCache3(STATRELATTINH,
+												 ObjectIdGetDatum(relid),
+												 Int16GetDatum(colnum),
+												 BoolGetDatum(rte->inh));
+			vardata.freefunc = ReleaseSysCache;
+		}
+	}
+	else
+	{
+		/* Expression --- maybe there are stats for the index itself */
+		relid = index->indexoid;
+		colnum = 1;
+
+		if (get_index_stats_hook &&
+			(*get_index_stats_hook) (root, relid, colnum, &vardata))
+		{
+			/*
+			 * The hook took control of acquiring a stats tuple.  If it did
+			 * supply a tuple, it'd better have supplied a freefunc.
+			 */
+			if (HeapTupleIsValid(vardata.statsTuple) &&
+				!vardata.freefunc)
+				elog(ERROR, "no function provided to release variable stats with");
+		}
+		else
+		{
+			vardata.statsTuple = SearchSysCache3(STATRELATTINH,
+												 ObjectIdGetDatum(relid),
+												 Int16GetDatum(colnum),
+												 BoolGetDatum(false));
+			vardata.freefunc = ReleaseSysCache;
+		}
+	}
+
+	if (HeapTupleIsValid(vardata.statsTuple))
+	{
+		Oid			sortop;
+		AttStatsSlot sslot;
+
+		sortop = get_opfamily_member(index->opfamily[0],
+									 index->opcintype[0],
+									 index->opcintype[0],
+									 BTLessStrategyNumber);
+		if (OidIsValid(sortop) &&
+			get_attstatsslot(&sslot, vardata.statsTuple,
+							 STATISTIC_KIND_CORRELATION, sortop,
+							 ATTSTATSSLOT_NUMBERS))
+		{
+			double		varCorrelation;
+
+			Assert(sslot.nnumbers == 1);
+			varCorrelation = sslot.numbers[0];
+
+			if (index->reverse_sort[0])
+				varCorrelation = -varCorrelation;
+
+			if (index->nkeycolumns > 1)
+				costs.indexCorrelation = varCorrelation * 0.75;
+			else
+				costs.indexCorrelation = varCorrelation;
+
+			free_attstatsslot(&sslot);
+		}
+	}
+
+	ReleaseVariableStats(vardata);
+
+	*indexStartupCost = costs.indexStartupCost;
+	*indexTotalCost = costs.indexTotalCost;
+	*indexSelectivity = costs.indexSelectivity;
+	*indexCorrelation = costs.indexCorrelation;
+	*indexPages = costs.numIndexPages;
 }

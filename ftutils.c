@@ -14,10 +14,7 @@
  */
 
 #include "postgres.h"
-
 #include <time.h>
-
-#include "nbtree.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
 #include "miscadmin.h"
@@ -26,6 +23,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
+#include "ftree.h"
 
 typedef struct BTSortArrayContext
 {
@@ -211,7 +209,7 @@ _bt_freestack(BTStack stack)
 void
 _bt_preprocess_array_keys(IndexScanDesc scan)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	int			numberOfKeys = scan->numberOfKeys;
 	int16	   *indoption = scan->indexRelation->rd_indoption;
 	int			numArrayKeys;
@@ -540,7 +538,7 @@ _bt_compare_array_elements(const void *a, const void *b, void *arg)
 void
 _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	int			i;
 
 	for (i = 0; i < so->numArrayKeys; i++)
@@ -566,7 +564,7 @@ _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir)
 bool
 _bt_advance_array_keys(IndexScanDesc scan, ScanDirection dir)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	bool		found = false;
 	int			i;
 
@@ -610,22 +608,18 @@ _bt_advance_array_keys(IndexScanDesc scan, ScanDirection dir)
 			break;
 	}
 
-	/* advance parallel scan */
-	if (scan->parallel_scan != NULL)
-		_bt_parallel_advance_array_keys(scan);
-
 	return found;
 }
 
 /*
- * _bt_mark_array_keys() -- Handle array keys during btmarkpos
+ * _ft_mark_array_keys() -- Handle array keys during btmarkpos
  *
  * Save the current state of the array keys as the "mark" position.
  */
 void
-_bt_mark_array_keys(IndexScanDesc scan)
+_ft_mark_array_keys(IndexScanDesc scan)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	int			i;
 
 	for (i = 0; i < so->numArrayKeys; i++)
@@ -644,7 +638,7 @@ _bt_mark_array_keys(IndexScanDesc scan)
 void
 _bt_restore_array_keys(IndexScanDesc scan)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	bool		changed = false;
 	int			i;
 
@@ -764,7 +758,7 @@ _bt_restore_array_keys(IndexScanDesc scan)
 void
 _bt_preprocess_keys(IndexScanDesc scan)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	int			numberOfKeys = scan->numberOfKeys;
 	int16	   *indoption = scan->indexRelation->rd_indoption;
 	int			new_numberOfKeys;
@@ -1384,7 +1378,7 @@ _bt_checkkeys(IndexScanDesc scan,
 	bool		tuple_alive;
 	IndexTuple	tuple;
 	TupleDesc	tupdesc;
-	BTScanOpaque so;
+	FTScanOpaque so;
 	int			keysz;
 	int			ikey;
 	ScanKey		key;
@@ -1409,7 +1403,7 @@ _bt_checkkeys(IndexScanDesc scan,
 		}
 		else
 		{
-			BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+			FTPageOpaque opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 
 			if (offnum > P_FIRSTDATAKEY(opaque))
 				return NULL;
@@ -1427,7 +1421,7 @@ _bt_checkkeys(IndexScanDesc scan,
 	tuple = (IndexTuple) PageGetItem(page, iid);
 
 	tupdesc = RelationGetDescr(scan->indexRelation);
-	so = (BTScanOpaque) scan->opaque;
+	so = (FTScanOpaque) scan->opaque;
 	keysz = so->numberOfKeys;
 
 	for (key = so->keyData, ikey = 0; ikey < keysz; key++, ikey++)
@@ -1752,9 +1746,9 @@ _bt_check_rowcompare(ScanKey skey, IndexTuple tuple, TupleDesc tupdesc,
 void
 _bt_killitems(IndexScanDesc scan)
 {
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	FTScanOpaque so = (FTScanOpaque) scan->opaque;
 	Page		page;
-	BTPageOpaque opaque;
+	FTPageOpaque opaque;
 	OffsetNumber minoff;
 	OffsetNumber maxoff;
 	int			i;
@@ -1803,7 +1797,7 @@ _bt_killitems(IndexScanDesc scan)
 		}
 	}
 
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	minoff = P_FIRSTDATAKEY(opaque);
 	maxoff = PageGetMaxOffsetNumber(page);
 
@@ -1867,12 +1861,12 @@ _bt_killitems(IndexScanDesc scan)
 typedef struct BTOneVacInfo
 {
 	LockRelId	relid;			/* global identifier of an index */
-	BTCycleId	cycleid;		/* cycle ID for its active VACUUM */
+	FTCycleId	cycleid;		/* cycle ID for its active VACUUM */
 } BTOneVacInfo;
 
 typedef struct BTVacInfo
 {
-	BTCycleId	cycle_ctr;		/* cycle ID most recently assigned */
+	FTCycleId	cycle_ctr;		/* cycle ID most recently assigned */
 	int			num_vacuums;	/* number of currently active VACUUMs */
 	int			max_vacuums;	/* allocated length of vacuums[] array */
 	BTOneVacInfo vacuums[FLEXIBLE_ARRAY_MEMBER];
@@ -1890,10 +1884,10 @@ static BTVacInfo *btvacinfo;
  * ensures that even if a VACUUM starts immediately afterwards, it cannot
  * process those pages until the page split is complete.
  */
-BTCycleId
+FTCycleId
 _bt_vacuum_cycleid(Relation rel)
 {
-	BTCycleId	result = 0;
+	FTCycleId	result = 0;
 	int			i;
 
 	/* Share lock is enough since this is a read-only operation */
@@ -1924,10 +1918,10 @@ _bt_vacuum_cycleid(Relation rel)
  * is not just a PG_TRY, but
  *		PG_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel))
  */
-BTCycleId
+FTCycleId
 _bt_start_vacuum(Relation rel)
 {
-	BTCycleId	result;
+	FTCycleId	result;
 	int			i;
 	BTOneVacInfo *vac;
 
@@ -2050,7 +2044,7 @@ BTreeShmemInit(void)
 		 * having it always start the same doesn't seem good.  Seed with
 		 * low-order bits of time() instead.
 		 */
-		btvacinfo->cycle_ctr = (BTCycleId) time(NULL);
+		btvacinfo->cycle_ctr = (FTCycleId) time(NULL);
 
 		btvacinfo->num_vacuums = 0;
 		btvacinfo->max_vacuums = MaxBackends;
@@ -2060,19 +2054,19 @@ BTreeShmemInit(void)
 }
 
 bytea *
-btoptions(Datum reloptions, bool validate)
+ftoptions(Datum reloptions, bool validate)
 {
 	return default_reloptions(reloptions, validate, RELOPT_KIND_BTREE);
 }
 
 /*
- *	btproperty() -- Check boolean properties of indexes.
+ *	ftproperty() -- Check boolean properties of indexes.
  *
  * This is optional, but handling AMPROP_RETURNABLE here saves opening the rel
  * to call btcanreturn.
  */
 bool
-btproperty(Oid index_oid, int attno,
+ftproperty(Oid index_oid, int attno,
 		   IndexAMProperty prop, const char *propname,
 		   bool *res, bool *isnull)
 {
@@ -2144,7 +2138,7 @@ _bt_check_natts(Relation rel, Page page, OffsetNumber offnum)
 {
 	int16		natts = IndexRelationGetNumberOfAttributes(rel);
 	int16		nkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
-	BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	FTPageOpaque opaque = (FTPageOpaque) PageGetSpecialPointer(page);
 	IndexTuple	itup;
 
 	/*
