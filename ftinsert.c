@@ -668,7 +668,7 @@ _ft_findinsertloc(Relation rel,
 	 * the per-page available space. Note that at this point, itemsz doesn't
 	 * include the ItemId.
 	 *
-	 * NOTE: if you change this, see also the similar code in _bt_buildadd().
+	 * NOTE: if you change this, see also the similar code in _ft_buildadd().
 	 */
 	if (itemsz > BTMaxItemSize(page))
 		ereport(ERROR,

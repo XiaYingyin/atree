@@ -77,7 +77,8 @@
  * parallel index builds.  This may be useful as a debugging aid.
 #undef DISABLE_LEADER_PARTICIPATION
  */
-
+#define INFINITY 0x7F800000
+#define SHRINKING_CONE_ERR 0.3
 /*
  * Status record for spooling/sorting phase.  (Note we may have two of
  * these due to the special requirements for uniqueness-checking with
@@ -93,9 +94,6 @@ typedef struct BTSpool
 
 /*
  * Working state for btbuild and its callback.
- *
- * When parallel CREATE INDEX is used, there is a BTBuildState for each
- * participant.
  */
 typedef struct BTBuildState
 {
@@ -125,7 +123,7 @@ typedef struct BTBuildState
  * writable copy anyway because we'll poke the page's address into it
  * before passing it up to the parent...)
  */
-typedef struct BTPageState
+typedef struct FTPageState
 {
 	Page		btps_page;		/* workspace for page building */
 	BlockNumber btps_blkno;		/* block # to write this page at */
@@ -133,22 +131,27 @@ typedef struct BTPageState
 	OffsetNumber btps_lastoff;	/* last item offset loaded */
 	uint32		btps_level;		/* tree level (0 = leaf) */
 	Size		btps_full;		/* "full" if less than this much free space */
-	struct BTPageState *btps_next;	/* link to parent level, if any */
-} BTPageState;
+	struct FTPageState *btps_next;	/* link to parent level, if any */
+} FTPageState;
 
 /*
  * Overall status record for index writing phase.
  */
-typedef struct BTWriteState
+typedef struct FTWriteState
 {
 	Relation	heap;
 	Relation	index;
 	bool		btws_use_wal;	/* dump pages to WAL? */
-	BlockNumber btws_pages_alloced; /* # pages allocated */
-	BlockNumber btws_pages_written; /* # pages written out */
-	Page		btws_zeropage;	/* workspace for filling zeroes */
-} BTWriteState;
+	BlockNumber ftws_pages_alloced; /* # pages allocated */
+	BlockNumber ftws_pages_written; /* # pages written out */
+	Page		ftws_zeropage;	/* workspace for filling zeroes */
+} FTWriteState;
 
+typedef struct ShrinkSegState {
+  float start_x, start_y;
+  float slope_low, slope_high;
+  ItemPointerData t_tid;
+} ShrinkSegState;
 
 static double _bt_spools_heapscan(Relation heap, Relation index,
 					BTBuildState *buildstate, IndexInfo *indexInfo);
@@ -156,18 +159,21 @@ static void _bt_spooldestroy(BTSpool *btspool);
 static void _bt_spool(BTSpool *btspool, ItemPointer self,
 		  Datum *values, bool *isnull);
 static void _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2);
-static void _bt_build_callback(Relation index, HeapTuple htup, Datum *values,
+static void _ft_build_callback(Relation index, HeapTuple htup, Datum *values,
 				   bool *isnull, bool tupleIsAlive, void *state);
 static Page _bt_blnewpage(uint32 level);
-static BTPageState *_bt_pagestate(BTWriteState *wstate, uint32 level);
+static FTPageState *_bt_pagestate(FTWriteState *wstate, uint32 level);
 static void _bt_slideleft(Page page);
 static void _bt_sortaddtup(Page page, Size itemsize,
 			   IndexTuple itup, OffsetNumber itup_off);
-static void _bt_buildadd(BTWriteState *wstate, BTPageState *state,
+static void _ft_buildadd(FTWriteState *wstate, FTPageState *state,
 			 IndexTuple itup);
-static void _bt_uppershutdown(BTWriteState *wstate, BTPageState *state);
-static void _bt_load(BTWriteState *wstate,
+static void _bt_uppershutdown(FTWriteState *wstate, FTPageState *state);
+static void _ft_load(FTWriteState *wstate,
 		 BTSpool *btspool, BTSpool *btspool2);
+static void _ft_shrinking_cone(ShrinkSegState *sss, FTWriteState *wstate, IndexTuple itup);
+static void _ft_new_nktup(ShrinkSegState *sss, NKeyTuple *nkt);
+static void _ft_buildadd_segment(ShrinkSegState *sss, NKeyTuple *nkt);
 
 /*
  *	ftbuild() -- build a new btree index.
@@ -260,8 +266,6 @@ _bt_spools_heapscan(Relation heap, Relation index, BTBuildState *buildstate,
 	/* Save as primary spool */
 	buildstate->spool = btspool;
 
-
-
 	/*
 	 * Begin serial/leader tuplesort.
 	 *
@@ -315,7 +319,7 @@ _bt_spools_heapscan(Relation heap, Relation index, BTBuildState *buildstate,
 	}
 
 	reltuples = IndexBuildHeapScan(heap, index, indexInfo, true,
-									   _bt_build_callback, (void *) buildstate,
+									   _ft_build_callback, (void *) buildstate,
 									   NULL);
 
 	/* okay, all heap tuples are spooled */
@@ -356,7 +360,7 @@ _bt_spool(BTSpool *btspool, ItemPointer self, Datum *values, bool *isnull)
 static void
 _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 {
-	BTWriteState wstate;
+	FTWriteState wstate;
 
 #ifdef BTREE_BUILD_STATS
 	if (log_btree_build_stats)
@@ -380,55 +384,19 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 	wstate.btws_use_wal = XLogIsNeeded() && RelationNeedsWAL(wstate.index);
 
 	/* reserve the metapage */
-	wstate.btws_pages_alloced = BTREE_METAPAGE + 1;
-	wstate.btws_pages_written = 0;
-	wstate.btws_zeropage = NULL;	/* until needed */
+	wstate.ftws_pages_alloced = BTREE_METAPAGE + 1;
+	wstate.ftws_pages_written = 0;
+	wstate.ftws_zeropage = NULL;	/* until needed */
 
-	_bt_load(&wstate, btspool, btspool2);
+	_ft_load(&wstate, btspool, btspool2);
 }
-
-
-//start是上一个拟合函数的起点，tuple是刚读进来处理的元组，slope_low、slope_high需要高一点的作用域，误差err先写死
-/*
-void 
-ShrinkingCone(KeyPosPairData tuple, KeyPosPairData start, float *slope_low, float *slope_high, float err)
-{
-	//x,y代指key，value
-	float x, y;
-	x = tuple->t_info;
-	y = tuple->pos;
-	NIndexTupleData nindextuple;
-	if(tuple == firsttuple)//需要判断tuple是不是索引列上第一个元素（TODO）
-	{
-		nindextuple = NIndexTupleData(tuple->t_info, 0);//构建一个新的起点斜率对
-		//store(nindextuple);//把tuple的（TODO）
-	}
-	else if(((y - start->pos) >= (x - start->info) * slope_low) && ((y - start->pos) <= (x - start->t_info) * slope_high))
-	{
-		slope_low = ((y - err) - start->pos) / (x - start->t_info);
-		slope_high = ((y + err) - start->pos) / (x - start->t_info);
-	}
-	else
-	{
-    x = start->t_info;
-		nindextuple = NIndexTupleData(x, slope_high);
-		store(nindextuple);
-		slope_low = 0;
-		slpoe_high = 100000000;//取一个极大数
-	}
-	
-}
-//////////////////
-
-*/
-
 
 /*
  * Per-tuple callback from IndexBuildHeapScan
  * Every Scan will call this callback
  */
 static void
-_bt_build_callback(Relation index,
+_ft_build_callback(Relation index,
 				   HeapTuple htup,
 				   Datum *values,
 				   bool *isnull,
@@ -437,11 +405,6 @@ _bt_build_callback(Relation index,
 {
   // use this callback func to construct linear function by scan table tuples
 	BTBuildState *buildstate = (BTBuildState *) state;
-
-  /*
-   * TODO: add codes to approximate function by Zhang Shaomin
-   *
-   */
 
   /*
 	 * insert the index tuple into the appropriate spool file for subsequent
@@ -490,7 +453,7 @@ _bt_blnewpage(uint32 level)
  * emit a completed btree page, and release the working storage.
  */
 static void
-_bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
+_bt_blwritepage(FTWriteState *wstate, Page page, BlockNumber blkno)
 {
 	/* Ensure rd_smgr is open (could have been closed by relcache flush!) */
 	RelationOpenSmgr(wstate->index);
@@ -509,14 +472,14 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 	 * zeroes anyway), but it should help to avoid fragmentation. The dummy
 	 * pages aren't WAL-logged though.
 	 */
-	while (blkno > wstate->btws_pages_written)
+	while (blkno > wstate->ftws_pages_written)
 	{
-		if (!wstate->btws_zeropage)
-			wstate->btws_zeropage = (Page) palloc0(BLCKSZ);
+		if (!wstate->ftws_zeropage)
+			wstate->ftws_zeropage = (Page) palloc0(BLCKSZ);
 		/* don't set checksum for all-zero page */
 		smgrextend(wstate->index->rd_smgr, MAIN_FORKNUM,
-				   wstate->btws_pages_written++,
-				   (char *) wstate->btws_zeropage,
+				   wstate->ftws_pages_written++,
+				   (char *) wstate->ftws_zeropage,
 				   true);
 	}
 
@@ -526,12 +489,12 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 	 * Now write the page.  There's no need for smgr to schedule an fsync for
 	 * this write; we'll do it ourselves before ending the build.
 	 */
-	if (blkno == wstate->btws_pages_written)
+	if (blkno == wstate->ftws_pages_written)
 	{
 		/* extending the file... */
 		smgrextend(wstate->index->rd_smgr, MAIN_FORKNUM, blkno,
 				   (char *) page, true);
-		wstate->btws_pages_written++;
+		wstate->ftws_pages_written++;
 	}
 	else
 	{
@@ -544,19 +507,19 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 }
 
 /*
- * allocate and initialize a new BTPageState.  the returned structure
- * is suitable for immediate use by _bt_buildadd.
+ * allocate and initialize a new FTPageState.  the returned structure
+ * is suitable for immediate use by _ft_buildadd.
  */
-static BTPageState *
-_bt_pagestate(BTWriteState *wstate, uint32 level)
+static FTPageState *
+_bt_pagestate(FTWriteState *wstate, uint32 level)
 {
-	BTPageState *state = (BTPageState *) palloc0(sizeof(BTPageState));
+	FTPageState *state = (FTPageState *) palloc0(sizeof(FTPageState));
 
 	/* create initial page for level */
 	state->btps_page = _bt_blnewpage(level);
 
 	/* and assign it a page position */
-	state->btps_blkno = wstate->btws_pages_alloced++;
+	state->btps_blkno = wstate->ftws_pages_alloced++;
 
 	state->btps_minkey = NULL;
 	/* initialize lastoff so first item goes into P_FIRSTKEY */
@@ -674,7 +637,7 @@ _bt_sortaddtup(Page page,
  *----------
  */
 static void
-_bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
+_ft_buildadd(FTWriteState *wstate, FTPageState *state, IndexTuple itup)
 {
 	Page		npage;
 	BlockNumber nblkno;
@@ -685,7 +648,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 	int			indnkeyatts = IndexRelationGetNumberOfKeyAttributes(wstate->index);
 
 	/*
-	 * This is a handy place to check for cancel interrupts during the btree
+	 * This is a handy place to check for cancel interrupts during the ftree
 	 * load phase of index creation.
 	 */
 	CHECK_FOR_INTERRUPTS();
@@ -743,7 +706,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 		npage = _bt_blnewpage(state->btps_level);
 
 		/* and assign it a page position */
-		nblkno = wstate->btws_pages_alloced++;
+		nblkno = wstate->ftws_pages_alloced++;
 
 		/*
 		 * We copy the last item on the page into the new page, and then
@@ -766,6 +729,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 		ItemIdSetUnused(ii);	/* redundant */
 		((PageHeader) opage)->pd_lower -= sizeof(ItemIdData);
 
+    // leaf node
 		if (indnkeyatts != indnatts && P_ISLEAF(opageop))
 		{
 			IndexTuple	truncated;
@@ -816,7 +780,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 		Assert(BTreeTupleGetNAtts(state->btps_minkey, wstate->index) == 0 ||
 			   !P_LEFTMOST(opageop));
 		BTreeInnerTupleSetDownLink(state->btps_minkey, oblkno);
-		_bt_buildadd(wstate, state->btps_next, state->btps_minkey);
+		_ft_buildadd(wstate, state->btps_next, state->btps_minkey);
 		pfree(state->btps_minkey);
 
 		/*
@@ -881,9 +845,9 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
  * Finish writing out the completed btree.
  */
 static void
-_bt_uppershutdown(BTWriteState *wstate, BTPageState *state)
+_bt_uppershutdown(FTWriteState *wstate, FTPageState *state)
 {
-	BTPageState *s;
+	FTPageState *s;
 	BlockNumber rootblkno = P_NONE;
 	uint32		rootlevel = 0;
 	Page		metapage;
@@ -921,7 +885,7 @@ _bt_uppershutdown(BTWriteState *wstate, BTPageState *state)
 			Assert(BTreeTupleGetNAtts(s->btps_minkey, wstate->index) == 0 ||
 				   !P_LEFTMOST(opaque));
 			BTreeInnerTupleSetDownLink(s->btps_minkey, blkno);
-			_bt_buildadd(wstate, s->btps_next, s->btps_minkey);
+			_ft_buildadd(wstate, s->btps_next, s->btps_minkey);
 			pfree(s->btps_minkey);
 			s->btps_minkey = NULL;
 		}
@@ -946,23 +910,33 @@ _bt_uppershutdown(BTWriteState *wstate, BTPageState *state)
 	_bt_blwritepage(wstate, metapage, BTREE_METAPAGE);
 }
 
+float gettupkey(short t_info) {
+  
+}
+
+float gettuppos(IndexTuple itup) {
+
+}
+
 /*
  * Read tuples in correct sort order from tuplesort, and load them into
- * btree leaves.
+ * ftree leaves.
  */
 static void
-_bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
+_ft_load(FTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 {
-	BTPageState *state = NULL;
+	FTPageState *state = NULL;
 	bool		merge = (btspool2 != NULL);
-	IndexTuple	itup,
-				itup2 = NULL;
+	IndexTuple	itup, itup2 = NULL;
 	bool		load1;
 	TupleDesc	tupdes = RelationGetDescr(wstate->index);
 	int			i,
 				keysz = IndexRelationGetNumberOfKeyAttributes(wstate->index);
 	ScanKey		indexScanKey = NULL;
 	SortSupport sortKeys;
+  NkeyTuple nktup;
+  ShrinkSegState *sss = (ShrinkSegState *) palloc0(sizeof(ShrinkSegState));
+  sss->slope_low = 0, sss->slope_high = INFINITY;
 
 	if (merge)
 	{
@@ -971,6 +945,7 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 		 * btspool and btspool2.
 		 */
 
+    NkeyTuple *nktup = NULL;
 		/* the preparation of merge */
 		// rewrite tuplesort_getindextuple function
 		itup = tuplesort_getindextuple(btspool->sortstate, true);
@@ -1043,18 +1018,27 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 				load1 = false;
 
 			/* When we see first tuple, create first index page */
-			if (state == NULL)
+			if (state == NULL) {
 				state = _bt_pagestate(wstate, 0);
+	      sss->start_x = gettupkey(itup->t_info);
+	      sss->start_y = gettuppos(itup->t_info);
+        ItemPointerData tid = _ft_buildadd_segment(itup);
+        sss->t_tid = tid; 
+      }
 
 			if (load1)
 			{
-				_bt_buildadd(wstate, state, itup);
 				itup = tuplesort_getindextuple(btspool->sortstate, true);
+				//_ft_buildadd(wstate, state, itup);
+        // ShringkingCone Segmentation
+        _ft_shrinking_cone(sss, wstate, state, itup);
 			}
 			else
 			{
-				_bt_buildadd(wstate, state, itup2);
 				itup2 = tuplesort_getindextuple(btspool2->sortstate, true);
+				//_ft_buildadd(wstate, state, itup2);
+        // ShringkingCone Segmentation
+        _ft_shrinking_cone(sss, wstate, state, itup);
 			}
 		}
 		pfree(sortKeys);
@@ -1066,10 +1050,16 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 											   true)) != NULL)
 		{
 			/* When we see first tuple, create first index page */
-			if (state == NULL)
+			if (state == NULL) {
 				state = _bt_pagestate(wstate, 0);
+        start_x = gettupkey(itup->t_info);
+        start_y = gettuppos(itup->t_info);
+        ItemPointerData tid = _ft_buildadd_segment(itup);
+        sss->t_tid = tid; 
+      }
 
-			_bt_buildadd(wstate, state, itup);
+			//_ft_buildadd(wstate, state, itup);
+      _ft_shrinking_cone(sss, wstate, state, itup);
 		}
 	}
 
@@ -1098,4 +1088,30 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 	}
 }
 
+static void _ft_shrinking_cone(ShrinkSegState *sss, FTWriteState *wstate, FTPageState *state, IndexTuple itup) {
+  float x = gettupkey(itup->t_info);
+  float y = gettuppos(itup->t_info);
 
+  ItemPointerData tid = _ft_buildadd_segment(itup);
+  if (((y - sss->start_y) >= (x - sss->start_x) * sss->slope_low) 
+  && ((y - sss->start_y) <= (x - sss->start_x) * sss->slope_high)) {
+    sss->slope_low = ((y - SHRINKING_CONE_ERR) - sss->start_y) / (x - sss->start_x);
+    sss->slope_high = ((y + SHRINKING_CONE_ERR) - sss->start_y) / (x - sss->start_x);
+  } else {
+    _ft_new_nktup(sss, nktup, tid);  
+    _ft_buildadd(wstate, state, nktup);
+    sss->start_x = gettupkey(itup->t_info);
+    sss->start_y = gettuppos(itup->t_info);
+    sss->slope_low = 0;
+    sss->slope_high = INFINITY;
+  }
+}
+
+static void _ft_new_nktup(ShrinkSegState *sss, NKeyTuple *nkt, ItemPointerData tid) {
+  nkt->tid = sss->tid;
+  sss->t_tid = tid;
+}
+
+static ItemPointerData _ft_buildadd_segment(IndexTuple itup) {
+  // TODO: add segment into page
+}
